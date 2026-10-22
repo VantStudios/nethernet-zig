@@ -135,12 +135,134 @@ fn writeMaxMessageSize(allocator: std.mem.Allocator, out: *std.ArrayList(u8), nu
 }
 
 pub fn editAnswer(allocator: std.mem.Allocator, sdp: []const u8, options: EditOptions) Error![]u8 {
-    const sized = try rewriteMaxMessageSize(allocator, sdp, options.max_message_size);
-    errdefer allocator.free(sized);
-    const candidate = options.public_candidate orelse return sized;
-    const injected = try injectPublicCandidate(allocator, sized, candidate);
-    allocator.free(sized);
-    return injected;
+    var current = try rewriteMaxMessageSize(allocator, sdp, options.max_message_size);
+    if (options.public_candidate) |candidate| {
+        const injected = injectPublicCandidate(allocator, current, candidate) catch |err| {
+            allocator.free(current);
+            return err;
+        };
+        allocator.free(current);
+        current = injected;
+    }
+
+    const with_default = applyDefaultCandidate(allocator, current, options.public_candidate) catch |err| {
+        allocator.free(current);
+        return err;
+    };
+    allocator.free(current);
+    return with_default;
+}
+
+const DefaultCandidate = struct {
+    address: []const u8,
+    port: u16,
+    ip6: bool,
+};
+
+fn defaultCandidate(sdp: []const u8, media: Media, preferred: ?PublicCandidate) ?DefaultCandidate {
+    var first: ?DefaultCandidate = null;
+    var ipv4: ?DefaultCandidate = null;
+    var index: usize = 0;
+    while (nextLine(sdp, index)) |line| : (index = line.next) {
+        if (line.start < media.start or line.start >= media.end) continue;
+        const trimmed = trimmedLine(line);
+        const prefix = "a=candidate:";
+        if (!std.mem.startsWith(u8, trimmed, prefix)) continue;
+        var fields = std.mem.tokenizeAny(u8, trimmed[prefix.len..], " \t");
+        _ = fields.next() orelse continue;
+        const component = fields.next() orelse continue;
+        if (!std.mem.eql(u8, component, "1")) continue;
+        const transport = fields.next() orelse continue;
+        if (!std.ascii.eqlIgnoreCase(transport, "udp")) continue;
+        _ = fields.next() orelse continue;
+        const address = fields.next() orelse continue;
+        const port = std.fmt.parseInt(u16, fields.next() orelse continue, 10) catch continue;
+        const typ = fields.next() orelse continue;
+        if (!std.mem.eql(u8, typ, "typ")) continue;
+        _ = fields.next() orelse continue;
+        if (port == 0) continue;
+
+        const candidate: DefaultCandidate = .{
+            .address = address,
+            .port = port,
+            .ip6 = std.mem.indexOfScalar(u8, address, ':') != null,
+        };
+        if (preferred) |wanted| {
+            if (wanted.port == candidate.port and std.mem.eql(u8, wanted.address, candidate.address)) {
+                return candidate;
+            }
+        }
+        if (first == null) first = candidate;
+        if (ipv4 == null and !candidate.ip6) ipv4 = candidate;
+    }
+    return ipv4 orelse first;
+}
+
+pub fn applyDefaultCandidate(allocator: std.mem.Allocator, sdp: []const u8, preferred: ?PublicCandidate) Error![]u8 {
+    const media = dataMedia(sdp) orelse return allocator.dupe(u8, sdp);
+    const candidate = defaultCandidate(sdp, media, preferred) orelse return allocator.dupe(u8, sdp);
+    const eol = lineEnding(sdp);
+
+    var out: std.ArrayList(u8) = .empty;
+    errdefer out.deinit(allocator);
+    try out.ensureTotalCapacity(allocator, sdp.len + 64);
+
+    var wrote_connection = false;
+    var index: usize = 0;
+    while (nextLine(sdp, index)) |line| : (index = line.next) {
+        if (line.start < media.start or line.start >= media.end) {
+            try out.appendSlice(allocator, sdp[line.start..line.next]);
+            continue;
+        }
+        const trimmed = trimmedLine(line);
+        if (std.mem.startsWith(u8, trimmed, "m=")) {
+            try writeMediaPort(allocator, &out, trimmed, candidate.port);
+            try out.appendSlice(allocator, eol);
+            continue;
+        }
+        if (std.mem.startsWith(u8, trimmed, "c=")) {
+            if (!wrote_connection) {
+                try writeConnection(allocator, &out, candidate);
+                try out.appendSlice(allocator, eol);
+                wrote_connection = true;
+            }
+            continue;
+        }
+        if (!wrote_connection) {
+            try writeConnection(allocator, &out, candidate);
+            try out.appendSlice(allocator, eol);
+            wrote_connection = true;
+        }
+        try out.appendSlice(allocator, sdp[line.start..line.next]);
+    }
+    if (!wrote_connection) {
+        if (out.items.len > 0 and out.items[out.items.len - 1] != '\n') try out.appendSlice(allocator, eol);
+        try writeConnection(allocator, &out, candidate);
+        try out.appendSlice(allocator, eol);
+    }
+    return out.toOwnedSlice(allocator);
+}
+
+fn writeMediaPort(allocator: std.mem.Allocator, out: *std.ArrayList(u8), line: []const u8, port: u16) Error!void {
+    const first_end = std.mem.indexOfAny(u8, line, " \t") orelse {
+        try out.appendSlice(allocator, line);
+        return;
+    };
+    const rest = std.mem.trimStart(u8, line[first_end..], " \t");
+    const second_end = std.mem.indexOfAny(u8, rest, " \t") orelse rest.len;
+    var buffer: [8]u8 = undefined;
+    const text = std.fmt.bufPrint(&buffer, "{d}", .{port}) catch unreachable;
+
+    try out.appendSlice(allocator, line[0..first_end]);
+    try out.append(allocator, ' ');
+    try out.appendSlice(allocator, text);
+    try out.append(allocator, ' ');
+    try out.appendSlice(allocator, std.mem.trimStart(u8, rest[second_end..], " \t"));
+}
+
+fn writeConnection(allocator: std.mem.Allocator, out: *std.ArrayList(u8), candidate: DefaultCandidate) Error!void {
+    try out.appendSlice(allocator, if (candidate.ip6) "c=IN IP6 " else "c=IN IP4 ");
+    try out.appendSlice(allocator, candidate.address);
 }
 
 const Candidate = struct {
@@ -482,4 +604,43 @@ test "editing an answer keeps fingerprints and identity out of the way" {
     try std.testing.expect(std.mem.indexOf(u8, edited, "a=fingerprint:sha-256 AA:BB\r\n") != null);
     try std.testing.expect(std.mem.indexOf(u8, edited, "a=identity:kept\r\n") != null);
     try std.testing.expect(std.mem.indexOf(u8, edited, "a=max-message-size:65536\r\n") != null);
+}
+
+test "the answer names its default candidate in the media port and connection line" {
+    const sdp = "v=0\r\n" ++
+        "m=application 9 UDP/DTLS/SCTP webrtc-datachannel\r\n" ++
+        "c=IN IP4 0.0.0.0\r\n" ++
+        "a=setup:active\r\n" ++
+        "a=candidate:1 1 udp 2130706431 2a0c:5a87::1 46229 typ host\r\n" ++
+        "a=candidate:2 1 udp 2130706431 192.168.1.209 41843 typ host\r\n" ++
+        "a=end-of-candidates\r\n" ++
+        "a=sctp-port:5000\r\n";
+
+    const edited = try applyDefaultCandidate(std.testing.allocator, sdp, null);
+    defer std.testing.allocator.free(edited);
+    try std.testing.expect(std.mem.indexOf(u8, edited, "m=application 41843 UDP/DTLS/SCTP webrtc-datachannel\r\n") != null);
+    try std.testing.expect(std.mem.indexOf(u8, edited, "c=IN IP4 192.168.1.209\r\n") != null);
+    try std.testing.expectEqual(@as(usize, 1), std.mem.count(u8, edited, "c=IN IP"));
+}
+
+test "a configured public candidate becomes the default candidate" {
+    const edited = try editAnswer(std.testing.allocator, answer_with_host, .{
+        .max_message_size = 65536,
+        .public_candidate = .{ .address = "203.0.113.10", .port = 19132 },
+    });
+
+    defer std.testing.allocator.free(edited);
+    try std.testing.expect(std.mem.indexOf(u8, edited, "m=application 19132 UDP/DTLS/SCTP webrtc-datachannel\r\n") != null);
+    try std.testing.expect(std.mem.indexOf(u8, edited, "c=IN IP4 203.0.113.10\r\n") != null);
+}
+
+test "an answer without candidates keeps its media port and connection line" {
+    const sdp = "v=0\r\n" ++
+        "m=application 9 UDP/DTLS/SCTP webrtc-datachannel\r\n" ++
+        "c=IN IP4 0.0.0.0\r\n" ++
+        "a=setup:active\r\n";
+
+    const edited = try applyDefaultCandidate(std.testing.allocator, sdp, null);
+    defer std.testing.allocator.free(edited);
+    try std.testing.expectEqualStrings(sdp, edited);
 }

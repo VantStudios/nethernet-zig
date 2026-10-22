@@ -1,0 +1,28 @@
+.{
+    .name = .nethernet_zig,
+    .version = "0.1.0",
+    .fingerprint = 0x1dd985bed16ba4cb,
+    .minimum_zig_version = "0.16.0",
+    .description = "NetherNet (Minecraft Bedrock LAN/P2P) transport library and example server, in Zig.",
+
+    .dependencies = .{
+        .webrtc = .{
+            .url = "git+https://github.com/zigouat/webrtc.git#1621f67452d269bc403e3e56c0be033d2f3fc064",
+            .hash = "webrtc-0.2.0-I5-xj7RpBgANFNetDCZln8jdEoZDr-lyCCBrB-Aj-4dL",
+        },
+        // Same pin `webrtc` uses, so the `ice.IceServer` this module hands the backend
+        // is the very type the backend expects: Zig deduplicates by hash.
+        .media_protocols = .{
+            .url = "git+https://github.com/zigouat/media-protocols.git#5af25b131d77e0558c0caf4dddb1e54074a769f1",
+            .hash = "media_protocols-0.2.0-WF_ij0o4CQD6Q4fwI7X-QcQeq1LgdDiQmNAWrFvDS7db",
+        },
+    },
+
+    .paths = .{
+        "build.zig",
+        "build.zig.zon",
+        "src",
+        "examples",
+        "README.md",
+    },
+}

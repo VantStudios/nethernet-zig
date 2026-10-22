@@ -1,0 +1,13 @@
+# Local Pi runtime state
+.atl/
+
+# Zig build outputs
+.zig-cache/
+zig-out/
+
+# Packages fetched by `zig fetch` / resolved from build.zig.zon
+zig-pkg/
+
+# Operator key and client trust anchors: secrets, never committed
+/server.key
+/pins.json

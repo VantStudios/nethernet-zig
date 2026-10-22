@@ -512,7 +512,7 @@ pub const Server = struct {
         var stream_reader = std.Io.net.Stream.reader(stream, self.io, input);
         var stream_writer = std.Io.net.Stream.writer(stream, self.io, &output_buffer);
 
-        if (!try sniffFirstChunk(&stream_reader.interface, &stream_writer.interface)) {
+        if (!try sniffFirstChunk(self.io, &stream_reader.interface, &stream_writer.interface)) {
             if (timed_out.load(.acquire)) writeRawError(&stream_writer.interface, "408 Request Timeout");
             return;
         }
@@ -536,7 +536,7 @@ pub const Server = struct {
                 std.log.err("failed to parse HTTP request head: {s}", .{@errorName(err)});
                 return err;
             };
-            std.log.info("HTTP request: {s} {s}", .{ @tagName(request.head.method), request.head.target });
+            std.log.info("HTTP request at ms={d}: {s} {s}", .{ wallClockMs(self.io), @tagName(request.head.method), request.head.target });
             var headers = request.iterateHeaders();
             while (headers.next()) |header| log.debug("HTTP header: {s}: {s}", .{ header.name, header.value });
 
@@ -967,6 +967,10 @@ fn writeRawError(writer: *std.Io.Writer, status_line: []const u8) void {
 
 const PeerProtocol = enum { http, tls };
 
+fn wallClockMs(io: std.Io) i96 {
+    return @divTrunc(std.Io.Clock.Timestamp.now(io, .real).raw.nanoseconds, std.time.ns_per_ms);
+}
+
 fn classifyFirstChunk(preview: []const u8) PeerProtocol {
     if (preview.len >= 3 and preview[0] == 0x16 and preview[1] == 0x03) return .tls;
     return .http;
@@ -995,7 +999,7 @@ fn setupFailureStatus(err: anyerror) std.http.Status {
 /// network failure for some clients, which then never try the plaintext fallback.
 const tls_handshake_failure_alert = [7]u8{ 0x15, 0x03, 0x03, 0x00, 0x02, 0x02, 0x28 };
 
-fn sniffFirstChunk(reader: *std.Io.Reader, writer: *std.Io.Writer) !bool {
+fn sniffFirstChunk(io: std.Io, reader: *std.Io.Reader, writer: *std.Io.Writer) !bool {
     reader.fillMore() catch |err| {
         std.log.warn("signaling peer sent nothing before closing: {s}", .{@errorName(err)});
         return false;
@@ -1004,8 +1008,8 @@ fn sniffFirstChunk(reader: *std.Io.Reader, writer: *std.Io.Writer) !bool {
     switch (classifyFirstChunk(received)) {
         .tls => {
             std.log.warn(
-                "signaling peer opened a TLS handshake ({d} bytes) on this port instead of HTTP; answering with a fatal TLS alert and closing so it falls back to plaintext.",
-                .{received.len},
+                "signaling peer opened a TLS handshake ({d} bytes) at ms={d} on this port instead of HTTP; answering with a fatal TLS alert and closing so it falls back to plaintext.",
+                .{ received.len, wallClockMs(io) },
             );
             writer.writeAll(&tls_handshake_failure_alert) catch {};
             writer.flush() catch {};

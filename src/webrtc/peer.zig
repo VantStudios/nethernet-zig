@@ -1,5 +1,6 @@
 const std = @import("std");
 const builtin = @import("builtin");
+const log = @import("../log.zig");
 const native = @import("webrtc");
 const ice = @import("ice");
 
@@ -279,16 +280,15 @@ pub const Peer = struct {
 
     pub fn attachChannel(self: *Peer, kind: ChannelKind, channel: DataChannel) PeerError!void {
         if (self.state == .closed or self.state == .failed) return error.InvalidState;
-        switch (kind) {
-            .reliable => {
-                if (self.reliable != null) return error.UnsupportedChannel;
-                self.reliable = channel;
-            },
-            .unreliable => {
-                if (self.unreliable != null) return error.UnsupportedChannel;
-                self.unreliable = channel;
-            },
+        const slot = switch (kind) {
+            .reliable => &self.reliable,
+            .unreliable => &self.unreliable,
+        };
+        if (slot.*) |existing| {
+            if (existing.ptr == channel.ptr) return;
+            return error.UnsupportedChannel;
         }
+        slot.* = channel;
     }
 
     pub fn tick(self: *Peer) PeerError!void {
@@ -329,7 +329,13 @@ pub const Peer = struct {
         return result;
     }
     pub fn send(self: *Peer, kind: ChannelKind, payload: []const u8) PeerError!void {
-        if (self.state != .connected) return error.InvalidState;
+        if (self.state == .closed or self.state == .failed) return error.InvalidState;
+        const open = switch (kind) {
+            .reliable => self.reliable_open,
+            .unreliable => self.unreliable_open,
+        };
+        if (!open) return error.InvalidState;
+
         if (payload.len > self.config.max_message_size) return error.InvalidDescription;
         const channel = switch (kind) {
             .reliable => self.reliable,
@@ -409,22 +415,13 @@ pub const Peer = struct {
     }
 
     fn openChannel(self: *Peer, kind: ChannelKind) PeerError!void {
-        switch (kind) {
-            .reliable => {
-                if (self.reliable_open) {
-                    try self.fail(error.UnsupportedChannel);
-                    return error.UnsupportedChannel;
-                }
-                self.reliable_open = true;
-            },
-            .unreliable => {
-                if (self.unreliable_open) {
-                    try self.fail(error.UnsupportedChannel);
-                    return error.UnsupportedChannel;
-                }
-                self.unreliable_open = true;
-            },
-        }
+        const open = switch (kind) {
+            .reliable => &self.reliable_open,
+            .unreliable => &self.unreliable_open,
+        };
+        if (open.*) return;
+
+        open.* = true;
         try self.enqueue(.{ .tag = .channel_opened, .channel = kind });
         self.updateConnectedState();
     }
@@ -606,6 +603,8 @@ pub const NativePeerConnection = struct {
     local_candidates_sent: usize = 0,
     remote_candidates_added: usize = 0,
     pumped: bool = false,
+    saw_datagram: bool = false,
+    datagrams_logged: usize = 0,
     closed: bool = false,
     sockets_closed: bool = false,
 
@@ -923,6 +922,14 @@ pub const NativePeerConnection = struct {
                     error.Canceled => return error.BackendFailure,
                     else => break,
                 };
+                if (!self.saw_datagram) {
+                    self.saw_datagram = true;
+                    log.debug("peer received its first datagram bytes={d} from={f} on={f}", .{ incoming.data.len, incoming.from, socket.address });
+                }
+                if (self.datagrams_logged < 80) {
+                    self.datagrams_logged += 1;
+                    log.debug("peer datagram #{d} bytes={d} from={f}", .{ self.datagrams_logged, incoming.data.len, incoming.from });
+                }
                 const result = self.connection.handleRead(.{
                     .data = incoming.data,
                     .from = &incoming.from,
@@ -942,10 +949,24 @@ pub const NativePeerConnection = struct {
     fn drainAppData(self: *NativePeerConnection, iterator: *native.PeerConnection.SctpMessageIterator) PeerError!void {
         while (iterator.next() catch return error.OutOfMemory) |message| {
             const data = @constCast(message.data);
+            log.debug("peer app data channel_id={d} binary={} bytes={d}", .{ message.channel_id, message.binary, data.len });
+            var adopted = false;
+            if (self.channelById(message.channel_id) == null) {
+                self.attachRemoteChannel(message.channel_id) catch |err| switch (err) {
+                    error.OutOfMemory => {
+                        if (data.len != 0) self.allocator.free(data);
+                        return error.OutOfMemory;
+                    },
+                    else => {},
+                };
+                adopted = true;
+            }
             const channel = self.channelById(message.channel_id) orelse {
+                log.debug("peer app data dropped: no channel for index {d}", .{message.channel_id});
                 if (data.len != 0) self.allocator.free(data);
                 continue;
             };
+            if (adopted) channel.pushSignal(.opened);
             channel.pushOwned(data, message.binary);
         }
     }
@@ -955,7 +976,10 @@ pub const NativePeerConnection = struct {
         while (true) {
             const message = (self.connection.pollTransmit(&buffer, now) catch
                 return error.BackendFailure) orelse return;
-            const socket = self.socketFor(message.from) orelse continue;
+            const socket = self.socketFor(message.from) orelse {
+                log.debug("peer outbound datagram dropped: no local socket for from={f} to={f} bytes={d}", .{ message.from, message.to, message.data.len });
+                continue;
+            };
             socket.send(self.io, message.to, message.data) catch continue;
         }
     }
@@ -994,7 +1018,13 @@ pub const NativePeerConnection = struct {
     }
 
     fn attachRemoteChannel(self: *NativePeerConnection, id: native.DataChannel.ChannelId) PeerError!void {
+        if (self.channelById(id)) |existing| {
+            try self.enqueue(.{ .attached = existing.kind });
+            return;
+        }
         const channel = self.connection.getDataChannel(id);
+
+        log.debug("peer remote channel id={d} label={s} stream={any}", .{ id, channel.getLabel(), channel.id });
         const kind: ChannelKind = if (std.mem.eql(u8, channel.getLabel(), reliable_label))
             .reliable
         else if (std.mem.eql(u8, channel.getLabel(), unreliable_label))
@@ -1492,7 +1522,7 @@ test "a channel overflow loses events, not the session" {
     try std.testing.expect(delivered);
 }
 
-test "duplicate channel open fails the peer" {
+test "a duplicate channel open is idempotent" {
     const allocator = std.testing.allocator;
     var backend = MockPeerConnection{};
     var reliable = MockChannel{};
@@ -1502,8 +1532,47 @@ test "duplicate channel open fails the peer" {
     reliable.push(.opened);
     try peer.tick();
     reliable.push(.opened);
-    try std.testing.expectError(error.UnsupportedChannel, peer.tick());
-    try std.testing.expectEqual(PeerState.failed, peer.stateOf());
+    try peer.tick();
+    try std.testing.expect(peer.reliable_open);
+    try std.testing.expectEqual(PeerState.new, peer.stateOf());
+}
+
+test "a repeated remote channel attach is idempotent" {
+    const allocator = std.testing.allocator;
+    var backend = MockPeerConnection{};
+    var remote = MockChannel{ .opened = true };
+    var peer = try Peer.init(allocator, backend.connection(), .{ .profile = .lan_trickle });
+    defer peer.deinit(allocator);
+
+    backend.push(.{ .channel_attached = .{ .kind = .reliable, .channel = remote.channel() } });
+    try peer.tick();
+    backend.push(.{ .channel_attached = .{ .kind = .reliable, .channel = remote.channel() } });
+    try peer.tick();
+
+    try std.testing.expect(peer.reliable != null);
+    try std.testing.expectEqual(PeerState.new, peer.stateOf());
+}
+
+test "an open channel can send before the peer finishes connecting" {
+    const allocator = std.testing.allocator;
+    var backend = MockPeerConnection{};
+    var reliable = MockChannel{ .opened = true };
+    var unreliable = MockChannel{};
+    var peer = try Peer.init(allocator, backend.connection(), .{ .profile = .http_full_ice });
+    defer peer.deinit(allocator);
+
+    _ = try peer.startOffer();
+    try peer.acceptAnswer(.{ .kind = .answer, .sdp = "answer" });
+    try peer.attachChannel(.reliable, reliable.channel());
+    try peer.attachChannel(.unreliable, unreliable.channel());
+    reliable.push(.opened);
+    backend.push(.{ .state_changed = .connecting });
+    try peer.tick();
+
+    try std.testing.expectEqual(PeerState.connecting, peer.stateOf());
+    try peer.send(.reliable, "early");
+    try std.testing.expectError(error.InvalidState, peer.send(.unreliable, "late"));
+    try std.testing.expectEqual(@as(usize, 5), reliable.sent_count);
 }
 
 test "remote channel attachment is adopted before channel polling" {

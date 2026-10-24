@@ -53,6 +53,10 @@ pub const Config = struct {
     max_pending_connections: usize = 256,
     negotiation_timeout_ms: i64 = 30_000,
     idle_timeout_ms: i64 = 120_000,
+    /// How long an established session survives once its peer stops being
+    /// `connected`. Without it a client that quit keeps its slot until the two minute
+    /// idle timeout, because the peer reports `disconnected` and never errors.
+    disconnect_timeout_ms: i64 = 3_000,
     echo_packets: bool = true,
     handler: ?peer_mod.MessageHandler = null,
     max_message_size: u32 = framing.default_message_size,
@@ -99,6 +103,8 @@ const Connection = struct {
     established: bool = false,
     deadline_ms: i64,
     last_activity_ms: i64,
+    /// Last tick this peer was `connected`; the disconnect grace counts from here.
+    last_connected_ms: i64,
 
     fn deinit(self: *Connection, handler: ?peer_mod.MessageHandler) void {
         if (self.opened) dispatch.closeFor(handler, &self.handle);
@@ -477,6 +483,7 @@ pub const Server = struct {
             .answer = signed_answer,
             .deadline_ms = now + self.config.negotiation_timeout_ms,
             .last_activity_ms = now,
+            .last_connected_ms = now,
         };
         connection.handle.peer = &connection.peer;
         log.debug("LAN offer sender={d} negotiated maxMessageSize={d}", .{ sender_id, max_message_size });
@@ -590,6 +597,7 @@ pub const Server = struct {
             connection.established = true;
             _ = self.established_total.fetchAdd(1, .monotonic);
             connection.last_activity_ms = now;
+            connection.last_connected_ms = now;
             std.log.info("LAN session established session id={d} sender={d} connection={s}", .{ connection.handle.id, connection.sender_id, connection.connection_id });
         }
 
@@ -613,6 +621,14 @@ pub const Server = struct {
             std.log.warn("LAN negotiation timed out sender={d}", .{connection.sender_id});
             self.failConnection(connection, .negotiation_timeout);
             return;
+        }
+        if (connection.established) {
+            if (connection.peer.stateOf() == .connected) {
+                connection.last_connected_ms = now;
+            } else if (now >= connection.last_connected_ms + self.config.disconnect_timeout_ms) {
+                std.log.info("LAN session lost its peer sender={d} state={s}", .{ connection.sender_id, @tagName(connection.peer.stateOf()) });
+                connection.terminate = true;
+            }
         }
         if (connection.established and now >= connection.last_activity_ms + self.config.idle_timeout_ms) {
             std.log.info("LAN session idle timeout sender={d}", .{connection.sender_id});

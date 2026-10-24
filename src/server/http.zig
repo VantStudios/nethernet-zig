@@ -34,6 +34,12 @@ pub const Config = struct {
     tick_shards: usize = 1,
     tick_interval_ms: i64 = 10,
     establish_timeout_ms: i64 = 15_000,
+    /// How long an *established* session survives after its peer leaves `connected`.
+    /// The establishment timeout is the wrong measure once a player is in the world:
+    /// a client that quits must not hold its slot for another 15 s. The ICE agent has
+    /// already spent its own silence window before it reports `disconnected`, so this
+    /// is the additional grace that keeps a brief network blip from ending the session.
+    disconnect_timeout_ms: i64 = 3_000,
     handler: ?peer_mod.MessageHandler = null,
     max_message_size: u32 = framing.default_message_size,
     max_packet_bytes: usize = framing.default_max_packet_bytes,
@@ -147,6 +153,12 @@ const Dispatcher = struct {
     }
 };
 
+/// A session that has been connected gets the short disconnect grace; one that never
+/// got there gets the full establishment timeout.
+fn peerGoneTimeout(config: Config, connected_once: bool) i64 {
+    return if (connected_once) config.disconnect_timeout_ms else config.establish_timeout_ms;
+}
+
 const ActiveSession = struct {
     allocator: std.mem.Allocator,
     native: *peer_mod.NativePeerConnection,
@@ -161,6 +173,9 @@ const ActiveSession = struct {
     last_progress_ms: i64 = 0,
     opened: bool = false,
     established: bool = false,
+    /// Once true the session is judged by `disconnect_timeout_ms`, not by the
+    /// establishment timeout, even after `established` drops back to false.
+    connected_once: bool = false,
 
     fn scratchEnsure(ctx: *anyopaque, needed: usize) framing.FramingError![]u8 {
         const self: *ActiveSession = @ptrCast(@alignCast(ctx));
@@ -221,6 +236,7 @@ pub const Server = struct {
         if (config.max_concurrent_requests == 0) return error.InvalidArgument;
         if (config.request_timeout_ms < 0 or config.gather_timeout_ms < 0) return error.InvalidArgument;
         if (config.establish_timeout_ms < 0) return error.InvalidArgument;
+        if (config.disconnect_timeout_ms < 0) return error.InvalidArgument;
         try peer_mod.validateIceServers(config.ice_servers);
         if (config.public_candidate) |candidate| try sdp_edit.validateCandidate(candidate);
         try validateServerData(config.server_data);
@@ -352,7 +368,8 @@ pub const Server = struct {
 
             if (active.peer.stateOf() == .connected) {
                 active.last_progress_ms = now;
-            } else if (now - active.last_progress_ms >= self.config.establish_timeout_ms) {
+                active.connected_once = true;
+            } else if (now - active.last_progress_ms >= peerGoneTimeout(self.config, active.connected_once)) {
                 std.log.warn("closing session id={d} networkId={s}: {s} for {d} ms", .{
                     active.handle.id,
                     log_id,
@@ -1838,6 +1855,12 @@ test "a second join in the same second is refused with 429" {
     const second = try rawExchange(io, address, request_writer.buffered(), &second_buffer);
     try std.testing.expect(std.mem.startsWith(u8, second, "HTTP/1.1 429"));
     try std.testing.expect(std.mem.indexOf(u8, second, "retry-after: 1") != null);
+}
+
+test "an established session is judged by the disconnect grace, not the establishment timeout" {
+    const config: Config = .{ .establish_timeout_ms = 15_000, .disconnect_timeout_ms = 3_000 };
+    try std.testing.expectEqual(@as(i64, 3_000), peerGoneTimeout(config, true));
+    try std.testing.expectEqual(@as(i64, 15_000), peerGoneTimeout(config, false));
 }
 
 test "a session that never connects is released when its deadline expires" {

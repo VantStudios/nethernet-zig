@@ -2,6 +2,7 @@ const std = @import("std");
 const builtin = @import("builtin");
 const native = @import("webrtc");
 const ice = @import("ice");
+const dgram = @import("../platform/dgram.zig");
 
 pub const max_remote_candidates: usize = 32;
 
@@ -588,7 +589,7 @@ pub const NativePeerConnection = struct {
     profile: Profile = .http_full_ice,
     gather_timeout_ms: i64 = 8_000,
     ice_servers: []const IceServer = &.{},
-    sockets: [max_ice_sockets]std.Io.net.Socket = undefined,
+    sockets: [max_ice_sockets]dgram.Socket = undefined,
     socket_addrs: [max_ice_sockets]std.Io.net.IpAddress = undefined,
     socket_count: usize = 0,
     local_bound: bool = false,
@@ -749,7 +750,7 @@ pub const NativePeerConnection = struct {
             // provide, so binding it cannot succeed and advertising it would be a
             // candidate no client can use.
             if (isIpv6LinkLocal(address)) continue;
-            const socket = address.bind(self.io, .{ .mode = .dgram }) catch continue;
+            const socket = dgram.Socket.bind(self.io, address) catch continue;
             self.sockets[self.socket_count] = socket;
             self.socket_addrs[self.socket_count] = socket.address;
             addresses[self.socket_count] = socket.address;
@@ -758,7 +759,7 @@ pub const NativePeerConnection = struct {
 
         if (self.socket_count == 0 and families.ip4) {
             const loopback: std.Io.net.IpAddress = .{ .ip4 = std.Io.net.Ip4Address.loopback(0) };
-            if (loopback.bind(self.io, .{ .mode = .dgram })) |socket| {
+            if (dgram.Socket.bind(self.io, loopback)) |socket| {
                 self.sockets[0] = socket;
                 self.socket_addrs[0] = socket.address;
                 addresses[0] = socket.address;
@@ -909,23 +910,20 @@ pub const NativePeerConnection = struct {
     }
 
     fn receiveDatagrams(self: *NativePeerConnection, now: i64) PeerError!void {
-        const poll_timeout: std.Io.Timeout = .{ .duration = .{
-            .clock = .awake,
-            .raw = .fromMilliseconds(0),
-        } };
         var buffer: [datagram_bytes]u8 = undefined;
 
         for (self.sockets[0..self.socket_count]) |*socket| {
             var received: usize = 0;
+            // A poll that returns nothing is the normal case; the ICE agent's timers
+            // drive everything else. `null` here means "no datagram now", never
+            // "socket broken" (see platform/dgram.zig for why Windows needs its own).
             while (received < max_datagrams_per_tick) : (received += 1) {
-                const incoming = socket.receiveTimeout(self.io, &buffer, poll_timeout) catch |err| switch (err) {
-                    error.Timeout => break,
-                    error.Canceled => return error.BackendFailure,
-                    else => break,
-                };
+                const incoming = socket.receive(self.io, &buffer) catch break;
+                const datagram = incoming orelse break;
+                const from = datagram.from;
                 const result = self.connection.handleRead(.{
-                    .data = incoming.data,
-                    .from = &incoming.from,
+                    .data = datagram.data,
+                    .from = &from,
                     .to = &socket.address,
                 }, now) catch continue;
                 switch (result) {
@@ -965,7 +963,7 @@ pub const NativePeerConnection = struct {
         }
     }
 
-    fn socketFor(self: *NativePeerConnection, address: *const std.Io.net.IpAddress) ?*std.Io.net.Socket {
+    fn socketFor(self: *NativePeerConnection, address: *const std.Io.net.IpAddress) ?*dgram.Socket {
         for (self.socket_addrs[0..self.socket_count], 0..) |*local, index| {
             if (local.eql(address)) return &self.sockets[index];
         }

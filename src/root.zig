@@ -67,6 +67,8 @@ pub const server = struct {
     pub const PlayerSource = server_policy.PlayerSource;
     pub const PingAnswer = server_motd.Pong;
     pub const queryPing = server_motd.query;
+    pub const SessionIds = server_host.SessionIds;
+    pub const SendError = server_host.Host.SendError;
 };
 
 pub const identity = struct {
@@ -86,6 +88,7 @@ pub const identity = struct {
     pub const Claims = identity_verify.Claims;
     pub const Verified = identity_verify.Verified;
     pub const SessionIdentity = identity_verify.SessionIdentity;
+    pub const SessionClaims = identity_verify.SessionClaims;
     pub const TokenKey = identity_verify.TokenKey;
     pub const IdentityPolicy = identity_verify.IdentityPolicy;
     pub const PinStore = identity_verify.PinStore;

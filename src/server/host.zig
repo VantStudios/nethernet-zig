@@ -13,6 +13,10 @@ const policy = @import("policy.zig");
 const http_srv = @import("http.zig");
 const lan_srv = @import("lan.zig");
 const motd_srv = @import("motd.zig");
+const session_ids = @import("session_ids.zig");
+const outbox_mod = @import("outbox.zig");
+
+pub const SessionIds = session_ids.SessionIds;
 
 pub const Host = struct {
     io: std.Io,
@@ -22,6 +26,8 @@ pub const Host = struct {
     http: ?http_srv.Server,
     lan: ?lan_srv.Server,
     motd: ?motd_srv.Server,
+    /// Shared by the listeners this host owns, so an id names one session.
+    session_ids: SessionIds = .{},
     stopping: std.atomic.Value(bool) = .init(false),
     run_thread: ?std.Thread = null,
 
@@ -56,6 +62,8 @@ pub const Host = struct {
         require_client_identity: ?bool = null,
         ice_servers: []const peer_mod.IceServer = &.{},
         public_candidate: ?sdp_edit.PublicCandidate = null,
+        spawn_ticker: bool = true,
+        player_source: ?policy.PlayerSource = null,
     };
 
     pub fn init(io: std.Io, allocator: std.mem.Allocator, config: Config) !*Host {
@@ -94,11 +102,22 @@ pub const Host = struct {
         };
 
         const occupancy = policy.PlayerSource{ .ctx = host, .count = countConnections };
-        const players = policy.PlayerSource{ .ctx = host, .count = countPlayers };
+        const players = config.player_source orelse policy.PlayerSource{ .ctx = host, .count = countPlayers };
 
-        if (config.paths.http) host.http = try http_srv.Server.init(io, allocator, httpConfig(config, occupancy, identity));
+        if (config.paths.http) {
+            var listener_config = httpConfig(config, occupancy, identity);
+            listener_config.id_source = &host.session_ids;
+            listener_config.player_source = players;
+            host.http = try http_srv.Server.init(io, allocator, listener_config);
+        }
+
         errdefer if (host.http) |*server| server.deinit();
-        if (config.paths.lan) host.lan = try lan_srv.Server.init(io, allocator, lanConfig(config, occupancy, identity));
+        if (config.paths.lan) {
+            var listener_config = lanConfig(config, occupancy, identity);
+            listener_config.id_source = &host.session_ids;
+            host.lan = try lan_srv.Server.init(io, allocator, listener_config);
+        }
+
         errdefer if (host.lan) |*server| server.deinit();
         if (config.paths.motd) host.motd = try motd_srv.Server.init(io, allocator, motdConfig(config, players));
         errdefer if (host.motd) |*server| server.deinit();
@@ -126,6 +145,7 @@ pub const Host = struct {
         self.stopping.store(false, .release);
         if (self.http) |*server| try server.start();
         errdefer self.stop();
+        if (!self.config.spawn_ticker) return;
         self.run_thread = try std.Thread.spawn(.{}, runLoop, .{self});
     }
 
@@ -161,6 +181,53 @@ pub const Host = struct {
         var count: usize = if (self.http) |*server| server.playerCount() else 0;
         if (self.lan) |*server| count += server.playerCount();
         return count;
+    }
+
+    pub const SendError = outbox_mod.EnqueueError || error{UnknownSession};
+
+    /// Queues a message for a session whichever path it came in on. Thread-safe, and it
+    /// never touches the transport directly: the listener's tick does the sending.
+    pub fn send(self: *Host, session_id: u64, kind: peer_mod.ChannelKind, payload: []const u8) SendError!void {
+        if (self.http) |*server| if (try trySend(server, session_id, kind, payload)) return;
+        if (self.lan) |*server| if (try trySend(server, session_id, kind, payload)) return;
+        return error.UnknownSession;
+    }
+
+    /// Delivers the queue and then retires the session. A no-op for an unknown id.
+    pub fn closeSession(self: *Host, session_id: u64) void {
+        if (self.http) |*server| server.closeSession(session_id);
+        if (self.lan) |*server| server.closeSession(session_id);
+    }
+
+    pub fn abortSession(self: *Host, session_id: u64) void {
+        if (self.http) |*server| server.abortSession(session_id);
+        if (self.lan) |*server| server.abortSession(session_id);
+    }
+
+    pub fn sessionMaxMessageSize(self: *Host, session_id: u64) ?u32 {
+        if (self.http) |*server| if (server.sessionMaxMessageSize(session_id)) |value| return value;
+        if (self.lan) |*server| if (server.sessionMaxMessageSize(session_id)) |value| return value;
+        return null;
+    }
+
+    /// Borrowed: the claims stay owned by the session and die with it.
+    pub fn sessionIdentity(self: *Host, session_id: u64) ?identity_verify.SessionIdentity {
+        if (self.http) |*server| if (server.sessionIdentity(session_id)) |value| return value;
+        if (self.lan) |*server| if (server.sessionIdentity(session_id)) |value| return value;
+        return null;
+    }
+
+    pub fn sessionClaims(self: *Host, session_id: u64) ?identity_verify.SessionClaims {
+        const identity = self.sessionIdentity(session_id) orelse return null;
+        return identity.claims;
+    }
+
+    fn trySend(server: anytype, session_id: u64, kind: peer_mod.ChannelKind, payload: []const u8) SendError!bool {
+        server.send(session_id, kind, payload) catch |err| switch (err) {
+            error.UnknownSession => return false,
+            else => return err,
+        };
+        return true;
     }
 
     pub fn connectionCount(self: *const Host) usize {
@@ -708,6 +775,166 @@ test "a rejoin with the same network id closes the session it replaces" {
     host.deinit();
     host_live = false;
     try std.testing.expectEqual(@as(usize, 2), counter.closed);
+}
+
+test "a host shares one session id source with every listener" {
+    const io = std.testing.io;
+    const host = try Host.init(io, std.testing.allocator, .{
+        .accept_unverified_identity = true,
+        .paths = .{ .motd = false },
+        .http_config = .{ .bind_address = .{ .ip4 = std.Io.net.Ip4Address.loopback(19981) } },
+        .lan_config = .{ .port = 19982 },
+    });
+    defer host.deinit();
+
+    try std.testing.expect(host.http.?.config.id_source == &host.session_ids);
+    try std.testing.expect(host.lan.?.config.id_source == &host.session_ids);
+
+    const first = host.session_ids.allocate();
+    const second = host.session_ids.allocate();
+    try std.testing.expect(second == first + 1);
+}
+
+test "a host without a ticker leaves the clock to its caller" {
+    const io = std.testing.io;
+    const host = try Host.init(io, std.testing.allocator, .{
+        .paths = .{ .http = false, .lan = false, .motd = false },
+        .spawn_ticker = false,
+    });
+    defer host.deinit();
+
+    try host.start();
+    try std.testing.expect(host.run_thread == null);
+    host.tick();
+    host.stop();
+    try std.testing.expect(host.run_thread == null);
+}
+
+test "a host that keeps its own ticker joins it on stop" {
+    const io = std.testing.io;
+    const host = try Host.init(io, std.testing.allocator, .{
+        .paths = .{ .http = false, .lan = false, .motd = false },
+    });
+    defer host.deinit();
+
+    try host.start();
+    try std.testing.expect(host.run_thread != null);
+    host.stop();
+    try std.testing.expect(host.run_thread == null);
+}
+
+test "the player source replaces the built-in count in status and motd" {
+    const io = std.testing.io;
+    const Counter = struct {
+        fn count(_: *anyopaque) usize {
+            return 7;
+        }
+    };
+    const source = policy.PlayerSource{ .ctx = @ptrFromInt(@alignOf(usize)), .count = Counter.count };
+
+    const host = try Host.init(io, std.testing.allocator, .{
+        .accept_unverified_identity = true,
+        .player_source = source,
+        .paths = .{ .lan = false },
+        .http_config = .{ .bind_address = .{ .ip4 = std.Io.net.Ip4Address.loopback(19983) } },
+        .motd_config = .{ .port = 19986 },
+    });
+    defer host.deinit();
+
+    const http_source = host.http.?.config.player_source.?;
+    try std.testing.expectEqual(@as(usize, 7), http_source.count(http_source.ctx));
+    const motd_source = host.motd.?.config.players.?;
+    try std.testing.expectEqual(@as(usize, 7), motd_source.count(motd_source.ctx));
+    try std.testing.expectEqual(@as(usize, 0), host.playerCount());
+
+    const address: std.Io.net.IpAddress = .{ .ip4 = std.Io.net.Ip4Address.loopback(19983) };
+    var response_buffer: [16 * 1024]u8 = undefined;
+    const status = try sendSignaling(
+        io,
+        host,
+        address,
+        "GET /v1/join HTTP/1.1\r\nhost: 127.0.0.1\r\nconnection: close\r\n\r\n",
+        &response_buffer,
+    );
+    try std.testing.expect(std.mem.startsWith(u8, status, "HTTP/1.1 200"));
+    try std.testing.expect(std.mem.indexOf(u8, status, "\"players\":7") != null);
+}
+
+test "the player source reaches the join cap" {
+    const io = std.testing.io;
+    const Counter = struct {
+        fn full(_: *anyopaque) usize {
+            return 1;
+        }
+    };
+    const host = try Host.init(io, std.testing.allocator, .{
+        .accept_unverified_identity = true,
+        .server_data = .{ .server_name = "cap", .level_name = "cap", .max_player_count = 1 },
+        .player_source = .{ .ctx = @ptrFromInt(@alignOf(usize)), .count = Counter.full },
+        .paths = .{ .lan = false, .motd = false },
+        .http_config = .{ .bind_address = .{ .ip4 = std.Io.net.Ip4Address.loopback(19984) } },
+    });
+    defer host.deinit();
+
+    const offer = try signedRealOffer(std.testing.allocator, io);
+    defer std.testing.allocator.free(offer);
+    var request_buffer: [8192]u8 = undefined;
+    var writer: std.Io.Writer = .fixed(&request_buffer);
+    try writer.print(
+        "POST /v1/join/cap-0001 HTTP/1.1\r\nhost: 127.0.0.1\r\ncontent-type: application/sdp\r\n" ++
+            "content-length: {d}\r\nconnection: close\r\n\r\n",
+        .{offer.len},
+    );
+    try writer.writeAll(offer);
+
+    var response_buffer: [16 * 1024]u8 = undefined;
+    const address: std.Io.net.IpAddress = .{ .ip4 = std.Io.net.Ip4Address.loopback(19984) };
+    const answer = try sendSignaling(io, host, address, writer.buffered(), &response_buffer);
+    try std.testing.expect(std.mem.startsWith(u8, answer, "HTTP/1.1 503"));
+    try std.testing.expectEqual(@as(usize, 0), host.http.?.sessionCount());
+}
+
+test "a signaling session is reached by id and retired through its queue" {
+    const io = std.testing.io;
+    const host = try Host.init(io, std.testing.allocator, .{
+        .accept_unverified_identity = true,
+        .paths = .{ .lan = false, .motd = false },
+        .http_config = .{ .bind_address = .{ .ip4 = std.Io.net.Ip4Address.loopback(19985) } },
+    });
+    defer host.deinit();
+
+    const offer = try signedRealOffer(std.testing.allocator, io);
+    defer std.testing.allocator.free(offer);
+    var request_buffer: [8192]u8 = undefined;
+    var writer: std.Io.Writer = .fixed(&request_buffer);
+    try writer.print(
+        "POST /v1/join/by-id-0001 HTTP/1.1\r\nhost: 127.0.0.1\r\ncontent-type: application/sdp\r\n" ++
+            "content-length: {d}\r\nconnection: close\r\n\r\n",
+        .{offer.len},
+    );
+    try writer.writeAll(offer);
+
+    var response_buffer: [16 * 1024]u8 = undefined;
+    const address: std.Io.net.IpAddress = .{ .ip4 = std.Io.net.Ip4Address.loopback(19985) };
+    const answer = try sendSignaling(io, host, address, writer.buffered(), &response_buffer);
+    try std.testing.expect(std.mem.startsWith(u8, answer, "HTTP/1.1 200"));
+
+    // The host handed out its first id, and that id is the session.
+    try std.testing.expectEqual(@as(u64, 1), host.session_ids.next.load(.monotonic));
+    try std.testing.expect(host.sessionMaxMessageSize(1) != null);
+    try std.testing.expect(host.sessionIdentity(1) != null);
+    try std.testing.expectError(error.UnknownSession, host.send(9_999, .reliable, "nobody"));
+
+    try host.send(1, .reliable, "hello");
+    host.closeSession(9_999);
+    // An abort drops what is queued and retires the session on the next tick.
+    host.abortSession(1);
+    host.tick();
+
+    try std.testing.expectEqual(@as(usize, 0), host.http.?.sessionCount());
+    try std.testing.expect(host.sessionMaxMessageSize(1) == null);
+    try std.testing.expect(host.sessionIdentity(1) == null);
+    try std.testing.expectError(error.UnknownSession, host.send(1, .reliable, "gone"));
 }
 
 fn cpkClaimFromAnswer(allocator: std.mem.Allocator, response: []const u8) ![]u8 {

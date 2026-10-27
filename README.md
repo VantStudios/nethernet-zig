@@ -122,6 +122,45 @@ pub fn main(init: std.process.Init) !void {
 `server.key` is created with `0600` on first start and reused afterwards.
 `host.keyFingerprint()` is the SHA-256 clients pin; a new key invalidates every pin.
 
+### Sending to a session
+
+```zig
+try host.send(session.id, .reliable, packet);
+host.closeSession(session.id); // flushes the queue, then closes
+host.abortSession(session.id); // drops the queue and closes at once
+
+if (host.sessionMaxMessageSize(session.id)) |limit| { ... }
+if (host.sessionClaims(session.id)) |claims| {
+    if (claims.xuid) |xuid| { ... }
+}
+```
+
+Ids are unique across every listener of a host, so an id from the HTTP path and one
+from the LAN path never collide. The claims are borrowed: they live and die with the
+session.
+
+### Threading contract
+
+| Call | Runs on | Waits on |
+| ---- | ------- | -------- |
+| `on_message` | the listener's tick, with that shard lock held | nothing: copy what you need and return |
+| `on_open` / `on_close` | a signaling or LAN thread | nothing: a slow handler stalls that socket |
+| `Host.send` | any thread | a copy into the session's outbox |
+| `Host.closeSession` / `abortSession` | any thread | the same outbox |
+| `Host.tick` | its own ticker, or the caller when `spawn_ticker = false` | each shard in turn |
+
+`Host.send` never touches SCTP: it copies the message into the session's outbox and
+returns, and the tick that owns the session drains it. `PeerHandle.send` has no such
+protection — it writes to the transport directly, so it belongs to the tick thread
+(inside `on_message`, for example). A slice returned from `on_message` is framed on the
+tick thread too.
+
+Lock order is `shard lock → session index → outbox`. Sending takes only the last two,
+which is why a game thread can enqueue while a shard is busy with a peer.
+
+`spawn_ticker = false` hands the clock to the caller: `start` opens the listeners and
+starts no thread, and the caller runs `host.tick()` from its own loop.
+
 The session table is allocated at `init`; `http_config.max_sessions` defaults to 256
 and `tick_shards` splits its locks across threads. An established session costs about
 41 KB and no thread of its own. On Linux, start the server before the Minecraft client

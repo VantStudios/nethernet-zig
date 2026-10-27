@@ -14,6 +14,8 @@ const identity_mod = @import("../identity/server.zig");
 const identity_verify = @import("../identity/verify.zig");
 const sdp_identity = @import("../identity/sdp.zig");
 const json = @import("../json.zig");
+const outbox_mod = @import("outbox.zig");
+const session_ids = @import("session_ids.zig");
 
 pub const Error = error{
     SendFailed,
@@ -71,6 +73,11 @@ pub const Config = struct {
     require_identity: bool = false,
     ice_servers: []const peer_mod.IceServer = &.{},
     public_candidate: ?sdp_edit.PublicCandidate = null,
+    /// Shared with every other listener the host runs; a local counter is used when absent.
+    id_source: ?*session_ids.SessionIds = null,
+    outbox_slots: usize = 512,
+    outbox_bytes: usize = 256 * 1024,
+    close_deadline_ms: i64 = 2_000,
 };
 
 fn peerConfig(max_message_size: u32, ice_servers: []const peer_mod.IceServer) peer_mod.PeerConfig {
@@ -93,6 +100,8 @@ const Connection = struct {
     connection_id: []u8,
     max_message_size: u32,
     assembly: framing.Channels,
+    outbox: outbox_mod.Outbox,
+    identity: ?identity_verify.SessionIdentity = null,
     answer: ?[]u8 = null,
     opened: bool = false,
     ufrag: [128]u8 = undefined,
@@ -108,6 +117,8 @@ const Connection = struct {
 
     fn deinit(self: *Connection, handler: ?peer_mod.MessageHandler) void {
         if (self.opened) dispatch.closeFor(handler, &self.handle);
+        self.outbox.deinit();
+        if (self.identity) |*identity| identity.deinit(self.allocator);
         self.peer.deinit(self.allocator);
         self.native.deinit();
         self.assembly.deinit();
@@ -161,6 +172,9 @@ pub const Server = struct {
     connection_total: std.atomic.Value(usize) = .init(0),
     established_total: std.atomic.Value(usize) = .init(0),
     next_connection_id: u64 = 0,
+    /// Reached from any thread; the connection array stays the tick thread's alone.
+    sessions_mutex: std.Io.Mutex = .init,
+    by_id: std.AutoHashMap(u64, *Connection),
     segment_scratch: []u8,
     recv_buffer: []u8,
     decode_buffer: []u8,
@@ -199,6 +213,7 @@ pub const Server = struct {
             .signal_buffer = signal_buffer,
             .frame_buffer = frame_buffer,
             .discovery_replies = ratelimit.Limiter.init(io, config.discovery_replies_per_second),
+            .by_id = std.AutoHashMap(u64, *Connection).init(allocator),
         };
         server.attemptBind();
         return server;
@@ -271,6 +286,7 @@ pub const Server = struct {
             connection.deinit(self.config.handler);
             slot.* = null;
         };
+        self.by_id.deinit();
         self.allocator.free(self.connections);
         self.allocator.free(self.segment_scratch);
         self.allocator.free(self.recv_buffer);
@@ -286,6 +302,95 @@ pub const Server = struct {
 
     pub fn playerCount(self: *const Server) usize {
         return self.established_total.load(.monotonic);
+    }
+
+    pub const SendError = outbox_mod.EnqueueError || error{UnknownSession};
+
+    /// Queues a whole message for one session. Thread-safe: it never waits on the
+    /// socket, so the game thread cannot be held up by a slow peer.
+    pub fn send(self: *Server, session_id: u64, kind: peer_mod.ChannelKind, payload: []const u8) SendError!void {
+        self.sessions_mutex.lockUncancelable(self.io);
+        defer self.sessions_mutex.unlock(self.io);
+        const connection = self.by_id.get(session_id) orelse return error.UnknownSession;
+        return connection.outbox.enqueue(outboxKind(kind), payload, connection.max_message_size);
+    }
+
+    /// Delivers what is queued, then retires the session on the next tick.
+    pub fn closeSession(self: *Server, session_id: u64) void {
+        const now = self.nowMs();
+        self.sessions_mutex.lockUncancelable(self.io);
+        defer self.sessions_mutex.unlock(self.io);
+        const connection = self.by_id.get(session_id) orelse return;
+        connection.outbox.requestClose(now);
+    }
+
+    pub fn abortSession(self: *Server, session_id: u64) void {
+        self.sessions_mutex.lockUncancelable(self.io);
+        defer self.sessions_mutex.unlock(self.io);
+        const connection = self.by_id.get(session_id) orelse return;
+        connection.outbox.requestAbort();
+    }
+
+    pub fn sessionMaxMessageSize(self: *Server, session_id: u64) ?u32 {
+        self.sessions_mutex.lockUncancelable(self.io);
+        defer self.sessions_mutex.unlock(self.io);
+        const connection = self.by_id.get(session_id) orelse return null;
+        return connection.max_message_size;
+    }
+
+    /// Borrowed: the claims stay owned by the session and die with it.
+    pub fn sessionIdentity(self: *Server, session_id: u64) ?identity_verify.SessionIdentity {
+        self.sessions_mutex.lockUncancelable(self.io);
+        defer self.sessions_mutex.unlock(self.io);
+        const connection = self.by_id.get(session_id) orelse return null;
+        return connection.identity;
+    }
+
+    fn allocateSessionId(self: *Server) u64 {
+        if (self.config.id_source) |source| return source.allocate();
+        self.next_connection_id +%= 1;
+        return self.next_connection_id;
+    }
+
+    fn indexConnection(self: *Server, connection: *Connection) bool {
+        self.sessions_mutex.lockUncancelable(self.io);
+        defer self.sessions_mutex.unlock(self.io);
+        self.by_id.put(connection.handle.id, connection) catch return false;
+        return true;
+    }
+
+    fn forgetConnectionId(self: *Server, connection: *const Connection) void {
+        self.sessions_mutex.lockUncancelable(self.io);
+        defer self.sessions_mutex.unlock(self.io);
+        _ = self.by_id.remove(connection.handle.id);
+    }
+
+    /// Sends what the outbox holds. Returns false once the session asked to close.
+    fn drainOutbox(self: *Server, connection: *Connection, now: i64) bool {
+        if (!connection.established) {
+            // Nothing can leave before the channel is up. A close asked for in that
+            // window drops the queue instead of holding the session open.
+            if (connection.outbox.closeRequested()) return false;
+            return true;
+        }
+        while (connection.outbox.pop(now)) |entry| {
+            if (entry.close) return false;
+            var label_buffer: [64]u8 = undefined;
+            const label = std.fmt.bufPrint(&label_buffer, "LAN session id={d}", .{connection.handle.id}) catch "LAN session";
+            dispatch.sendPacket(
+                self.segmentScratch(),
+                connection.max_message_size,
+                &connection.handle,
+                peerKind(entry.kind),
+                label,
+                entry.bytes,
+            ) catch |err| {
+                std.log.warn("{s} send failed: {s}", .{ label, @errorName(err) });
+                connection.outbox.requestAbort();
+                return true;
+            };
+        }
+        return true;
     }
 
     pub fn tick(self: *Server) void {
@@ -386,11 +491,18 @@ pub const Server = struct {
             return;
         };
         var failure: discovery.ErrorCode = .generic_failure;
-        const connection = self.createConnection(sender_id, signal, source, &failure) catch |err| {
+        const connection = self.createConnection(sender_id, signal, source, identity, &failure) catch |err| {
             std.log.warn("LAN negotiation setup failed sender={d}: {s}", .{ sender_id, @errorName(err) });
             try self.sendErrorCode(sender_id, signal.connection_id, failure, source);
             return;
         };
+        // Indexed before the handler can see it, so a send never misses a session
+        // that already exists.
+        if (!self.indexConnection(connection)) {
+            connection.deinit(self.config.handler);
+            try self.sendErrorCode(sender_id, signal.connection_id, .generic_failure, source);
+            return;
+        }
         dispatch.openFor(self.config.handler, &connection.handle);
         connection.opened = true;
         slot.* = connection;
@@ -415,8 +527,13 @@ pub const Server = struct {
         sender_id: u64,
         signal: discovery.SignalRef,
         source: udp.Address,
+        verified: ?identity_verify.SessionIdentity,
         failure: *discovery.ErrorCode,
     ) Error!*Connection {
+        // The claims are consumed on entry, so a failed setup cannot leave them behind.
+        var pending_identity = verified;
+        errdefer if (pending_identity) |*identity| identity.deinit(self.allocator);
+
         const now = self.nowMs();
         const clean_offer = try sdp_identity.withoutIdentity(self.allocator, signal.data);
         defer self.allocator.free(clean_offer);
@@ -468,24 +585,38 @@ pub const Server = struct {
         errdefer self.allocator.free(signed_answer);
 
         const connection = try self.allocator.create(Connection);
-        errdefer self.allocator.destroy(connection);
-        self.next_connection_id += 1;
+        var session_ready = false;
+        errdefer if (!session_ready) self.allocator.destroy(connection);
+
+        const outbox = try outbox_mod.Outbox.init(
+            self.io,
+            self.allocator,
+            self.config.outbox_slots,
+            @max(self.config.outbox_bytes, max_message_size),
+            self.config.close_deadline_ms,
+        );
+        errdefer if (!session_ready) outbox.deinit();
+
         connection.* = .{
             .allocator = self.allocator,
             .native = native,
             .peer = connection_peer,
-            .handle = .{ .id = self.next_connection_id, .peer = undefined },
+            .handle = .{ .id = self.allocateSessionId(), .peer = undefined },
             .sender_id = sender_id,
             .address = source,
             .connection_id = connection_id,
             .max_message_size = max_message_size,
             .assembly = framing.Channels.init(self.allocator, max_message_size, self.config.max_packet_bytes),
+            .outbox = outbox,
+            .identity = pending_identity,
             .answer = signed_answer,
             .deadline_ms = now + self.config.negotiation_timeout_ms,
             .last_activity_ms = now,
             .last_connected_ms = now,
         };
         connection.handle.peer = &connection.peer;
+        pending_identity = null;
+        session_ready = true;
         log.debug("LAN offer sender={d} negotiated maxMessageSize={d}", .{ sender_id, max_message_size });
         if (sdp_identity.iceUfrag(stripped)) |ufrag| {
             const length = @min(ufrag.len, connection.ufrag.len);
@@ -548,6 +679,7 @@ pub const Server = struct {
             std.log.info("LAN connection released session id={d} sender={d} connection={s}", .{ connection.handle.id, connection.sender_id, connection.connection_id });
             _ = self.connection_total.fetchSub(1, .monotonic);
             if (connection.established) _ = self.established_total.fetchSub(1, .monotonic);
+            self.forgetConnectionId(connection);
             connection.deinit(self.config.handler);
             slot.* = null;
         }
@@ -606,6 +738,12 @@ pub const Server = struct {
             self.allocator.free(answer);
             connection.answer = null;
             std.log.info("LAN CONNECTRESPONSE sent sender={d} bytes={d}", .{ connection.sender_id, answer.len });
+        }
+
+        if (!self.drainOutbox(connection, now)) {
+            std.log.info("LAN session released on request id={d} sender={d}", .{ connection.handle.id, connection.sender_id });
+            connection.terminate = true;
+            return;
         }
 
         var candidate_buffer: [candidate_buffer_size]u8 = undefined;
@@ -742,6 +880,20 @@ pub const Server = struct {
     }
 };
 
+fn outboxKind(kind: peer_mod.ChannelKind) outbox_mod.Kind {
+    return switch (kind) {
+        .reliable => .reliable,
+        .unreliable => .unreliable,
+    };
+}
+
+fn peerKind(kind: outbox_mod.Kind) peer_mod.ChannelKind {
+    return switch (kind) {
+        .reliable => .reliable,
+        .unreliable => .unreliable,
+    };
+}
+
 fn failureFor(err: peer_mod.PeerError) discovery.ErrorCode {
     return switch (err) {
         error.BackendFailure => .ice,
@@ -789,7 +941,7 @@ fn validateOffer(allocator: std.mem.Allocator, network_id: []const u8, offer: []
         if (check.policy) |admission| {
             if (!admission.allow(admission.ctx, network_id, &verified.claims)) return error.IdentityRejected;
         }
-        return verified.sessionIdentity();
+        return try verified.sessionIdentity(allocator);
     }
 
     var envelope = sdp_identity.extract(offer, allocator, .{}) catch |err| switch (err) {
@@ -811,7 +963,7 @@ fn validateOffer(allocator: std.mem.Allocator, network_id: []const u8, offer: []
     if (check.policy) |admission| {
         if (!admission.allow(admission.ctx, network_id, null)) return error.IdentityRejected;
     }
-    return identity.sessionIdentity();
+    return try identity.sessionIdentity(allocator);
 }
 
 fn identityLabel(identity: ?identity_verify.SessionIdentity) []const u8 {
@@ -1477,6 +1629,57 @@ test "an idle LAN session costs a bounded slice of memory" {
     try std.testing.expect(per_session < 100 * 1024);
 
     server.deinit();
+}
+
+test "LAN sessions take their ids from the configured source" {
+    const io = std.testing.io;
+    const allocator = std.testing.allocator;
+    var ids = session_ids.SessionIds{};
+    var server = try Server.init(io, allocator, .{
+        .port = 19954,
+        .max_pending_connections = 8,
+        .discovery_replies_per_second = 0,
+        .id_source = &ids,
+    });
+    if (!server.isBound()) {
+        server.deinit();
+        return error.SkipZigTest;
+    }
+    defer server.deinit();
+
+    const source: udp.Address = .{ .port = std.mem.nativeToBig(u16, 41003), .addr = std.mem.nativeToBig(u32, 0x7f000001) };
+    var id_buffer: [16]u8 = undefined;
+    var signal_buffer: [8192]u8 = undefined;
+    for (0..2) |index| {
+        const connection_id = try std.fmt.bufPrint(&id_buffer, "shared-{d:0>4}", .{index});
+        var writer: std.Io.Writer = .fixed(&signal_buffer);
+        try (discovery.Signal{ .kind = .connect_request, .connection_id = connection_id, .data = real_offer }).write(&writer);
+        const frame = try discovery.encodeMessage(allocator, 0x6200 + index, server.config.network_id, writer.buffered());
+        defer allocator.free(frame);
+        try server.handleDatagram(frame, source);
+    }
+    try std.testing.expectEqual(@as(usize, 2), server.connectionCount());
+
+    // Both ids came from the shared counter, so the next one is past both.
+    const next = ids.allocate();
+    try std.testing.expect(next >= 3);
+
+    var session_id: u64 = 0;
+    var iterator = server.by_id.keyIterator();
+    while (iterator.next()) |key| {
+        try std.testing.expect(key.* < next);
+        session_id = key.*;
+    }
+    try std.testing.expect(server.sessionMaxMessageSize(session_id) != null);
+    try std.testing.expect(server.sessionIdentity(session_id) == null);
+
+    try server.send(session_id, .reliable, "hello");
+    try std.testing.expectEqual(@as(usize, 1), server.by_id.get(session_id).?.outbox.pendingCount());
+
+    server.closeSession(session_id);
+    server.closeSession(9_999);
+    server.abortSession(9_999);
+    try std.testing.expectError(error.UnknownSession, server.send(9_999, .reliable, "nobody"));
 }
 
 test "LAN candidate attributes follow the Zig formatter" {

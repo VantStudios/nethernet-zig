@@ -41,6 +41,9 @@ pub const PeerHandle = struct {
     peer: *Peer,
     user_data: ?*anyopaque = null,
 
+    /// Not thread-safe: it writes to the transport directly. Call it from the thread
+    /// that ticks this peer (inside `on_message`, for instance); from anywhere else,
+    /// queue the payload through the owning server's outbox instead.
     pub fn send(self: *PeerHandle, kind: ChannelKind, payload: []const u8) PeerError!void {
         return self.peer.send(kind, payload);
     }

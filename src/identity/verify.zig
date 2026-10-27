@@ -46,10 +46,75 @@ pub const Claims = struct {
     permissions: ?[]const u8 = null,
 };
 
+/// What the token said about the player, copied out of the parse tree that read it so
+/// it outlives that tree. `SessionIdentity.deinit` frees it.
+pub const SessionClaims = struct {
+    xuid: ?[]u8 = null,
+    uuid: ?[]u8 = null,
+    playfab_id: ?[]u8 = null,
+    permissions: ?[]u8 = null,
+
+    pub fn init(allocator: std.mem.Allocator, claims: *const Claims) std.mem.Allocator.Error!SessionClaims {
+        var copied: SessionClaims = .{};
+        errdefer copied.deinit(allocator);
+        copied.xuid = try copyClaim(allocator, claims.xuid);
+        copied.uuid = try copyClaim(allocator, claims.uuid);
+        copied.playfab_id = try copyClaim(allocator, claims.playfab_id);
+        copied.permissions = try copyClaim(allocator, claims.permissions);
+        return copied;
+    }
+
+    pub fn deinit(self: *SessionClaims, allocator: std.mem.Allocator) void {
+        for ([_]?[]u8{ self.xuid, self.uuid, self.playfab_id, self.permissions }) |claim| {
+            if (claim) |bytes| allocator.free(bytes);
+        }
+        self.* = .{};
+    }
+};
+
+fn copyClaim(allocator: std.mem.Allocator, claim: ?[]const u8) std.mem.Allocator.Error!?[]u8 {
+    const value = claim orelse return null;
+    return try allocator.dupe(u8, value);
+}
+
+/// The unanchored path keeps the token as JSON, so the claims are read back out of it.
+fn sessionClaimsFromJson(allocator: std.mem.Allocator, claims_json: []const u8) Error!SessionClaims {
+    var parsed = std.json.parseFromSlice(std.json.Value, allocator, claims_json, .{}) catch return error.InvalidIdentity;
+    defer parsed.deinit();
+    const object = switch (parsed.value) {
+        .object => |object| object,
+        else => return error.InvalidIdentity,
+    };
+
+    var claims: SessionClaims = .{};
+    errdefer claims.deinit(allocator);
+    claims.xuid = try copyMember(allocator, object, "xuid");
+    claims.uuid = try copyMember(allocator, object, "uuid");
+    claims.playfab_id = try copyMember(allocator, object, "playfabId");
+    claims.permissions = try copyMember(allocator, object, "permissions");
+    return claims;
+}
+
+fn copyMember(allocator: std.mem.Allocator, object: std.json.ObjectMap, name: []const u8) std.mem.Allocator.Error!?[]u8 {
+    const value = object.get(name) orelse return null;
+    return switch (value) {
+        .string => |text| try allocator.dupe(u8, text),
+        else => null,
+    };
+}
+
 pub const SessionIdentity = struct {
     form: Form,
     key_sha256: [std.crypto.hash.sha2.Sha256.digest_length]u8,
     anchored: bool = false,
+    claims: ?SessionClaims = null,
+
+    /// The claims are borrowed slices: a consumer that copies this value must not call
+    /// this twice, and must not call it on a copy either.
+    pub fn deinit(self: *SessionIdentity, allocator: std.mem.Allocator) void {
+        if (self.claims) |*claims| claims.deinit(allocator);
+        self.* = undefined;
+    }
 };
 
 pub const Verified = struct {
@@ -65,8 +130,13 @@ pub const Verified = struct {
         self.* = undefined;
     }
 
-    pub fn sessionIdentity(self: Verified) SessionIdentity {
-        return .{ .form = self.claims.form, .key_sha256 = self.cpk_digest, .anchored = true };
+    pub fn sessionIdentity(self: Verified, allocator: std.mem.Allocator) std.mem.Allocator.Error!SessionIdentity {
+        return .{
+            .form = self.claims.form,
+            .key_sha256 = self.cpk_digest,
+            .anchored = true,
+            .claims = try SessionClaims.init(allocator, &self.claims),
+        };
     }
 };
 
@@ -303,11 +373,16 @@ pub const Identity = struct {
         self.* = undefined;
     }
 
-    pub fn sessionIdentity(self: Identity) SessionIdentity {
+    pub fn sessionIdentity(self: Identity, allocator: std.mem.Allocator) Error!SessionIdentity {
         const der = spkiDer(self.public_key);
         var digest: [std.crypto.hash.sha2.Sha256.digest_length]u8 = undefined;
         std.crypto.hash.sha2.Sha256.hash(&der, &digest, .{});
-        return .{ .form = self.form, .key_sha256 = digest, .anchored = false };
+        return .{
+            .form = self.form,
+            .key_sha256 = digest,
+            .anchored = false,
+            .claims = try sessionClaimsFromJson(allocator, self.claims),
+        };
     }
 };
 
@@ -675,6 +750,7 @@ pub const VerifiedAnswer = struct {
     anchored: bool,
 
     pub fn deinit(self: *VerifiedAnswer, allocator: std.mem.Allocator) void {
+        self.identity.deinit(allocator);
         allocator.free(self.idp_domain);
         allocator.free(self.clean_sdp);
         self.* = undefined;
@@ -703,7 +779,7 @@ pub fn verifyAnswer(io: std.Io, allocator: std.mem.Allocator, answer_sdp: []cons
     defer token.deinit(allocator);
     try verifyFingerprints(allocator, token.public_key, parsed.value.fingerprints, answer_sdp);
 
-    var identity = token.sessionIdentity();
+    var identity = try token.sessionIdentity(allocator);
     const anchored = switch (options.trust) {
         .transport_authenticated => true,
         .pinned => |store| try store.require(identity.key_sha256, envelope.idp.domain, options.allow_key_change),
@@ -899,13 +975,13 @@ fn clientOffer(allocator: std.mem.Allocator, issuer: Scheme.KeyPair, peer: Schem
     const claims_json = if (options.exp_offset) |offset|
         try std.fmt.allocPrint(
             allocator,
-            "{{\"cpk\":{s},\"exp\":{d},\"iat\":{d},\"xuid\":\"2535400000000001\",\"permissions\":\"player\"}}",
+            "{{\"cpk\":{s},\"exp\":{d},\"iat\":{d},\"xuid\":\"2535400000000001\",\"uuid\":\"069a79f4-44e9-4726-a5be-fca90e38aaf5\",\"permissions\":\"player\"}}",
             .{ claim, now + offset, now + options.iat_offset },
         )
     else
         try std.fmt.allocPrint(
             allocator,
-            "{{\"cpk\":{s},\"iat\":{d},\"xuid\":\"2535400000000001\",\"permissions\":\"player\"}}",
+            "{{\"cpk\":{s},\"iat\":{d},\"xuid\":\"2535400000000001\",\"uuid\":\"069a79f4-44e9-4726-a5be-fca90e38aaf5\",\"permissions\":\"player\"}}",
             .{ claim, now + options.iat_offset },
         );
     defer allocator.free(claims_json);
@@ -1010,6 +1086,7 @@ test "the auth service's token and the peer's signature verify in either cpk for
     defer verifier.deinit();
 
     var digests: [2]SessionIdentity = undefined;
+    defer for (&digests) |*digest| digest.deinit(testing.allocator);
     for ([_]Form{ .jwk, .base64_der }, 0..) |form, index| {
         const offer = try clientOffer(testing.allocator, issuer, peer, .{ .form = form });
         defer testing.allocator.free(offer);
@@ -1025,12 +1102,36 @@ test "the auth service's token and the peer's signature verify in either cpk for
         try testing.expectEqualSlices(u8, &expected, &verified.cpk_der);
         try testing.expectEqualSlices(u8, &expected, &spkiDer(verified.public_key));
 
-        digests[index] = verified.sessionIdentity();
+        digests[index] = try verified.sessionIdentity(testing.allocator);
+        try testing.expectEqualStrings("2535400000000001", digests[index].claims.?.xuid.?);
         try testing.expectEqual(form, digests[index].form);
         try testing.expect(digests[index].anchored);
         try testing.expectEqualSlices(u8, &verified.cpk_digest, &digests[index].key_sha256);
     }
     try testing.expectEqualSlices(u8, &digests[0].key_sha256, &digests[1].key_sha256);
+}
+
+test "session claims outlive the verified token they came from" {
+    const issuer = try testKey(0x41);
+    const peer = try testKey(0x42);
+    const jwks = try jwksDocument(testing.allocator, issuer.public_key, issuer_kid);
+    defer testing.allocator.free(jwks);
+    var verifier = try verifierFor(jwks);
+    defer verifier.deinit();
+
+    const offer = try clientOffer(testing.allocator, issuer, peer, .{});
+    defer testing.allocator.free(offer);
+
+    var verified = try verifier.verifyOffer(offer);
+    var identity = try verified.sessionIdentity(testing.allocator);
+    verified.deinit(testing.allocator);
+    defer identity.deinit(testing.allocator);
+
+    try testing.expect(identity.anchored);
+    try testing.expectEqualStrings("2535400000000001", identity.claims.?.xuid.?);
+    try testing.expectEqualStrings("player", identity.claims.?.permissions.?);
+    try testing.expectEqualStrings("069a79f4-44e9-4726-a5be-fca90e38aaf5", identity.claims.?.uuid.?);
+    try testing.expect(identity.claims.?.playfab_id == null);
 }
 
 test "a claim that does not verify is refused, never returned as verified" {
@@ -1170,7 +1271,10 @@ test "a client token signed with the auth service's rsa key is verified" {
     try testing.expectEqualStrings("2535000000000001", verified.claims.xuid.?);
     try testing.expectEqualStrings("player", verified.claims.permissions.?);
     try testing.expectEqual(@as(i64, 4_102_444_800), verified.claims.expires_at);
-    try testing.expect(verified.sessionIdentity().anchored);
+    var identity = try verified.sessionIdentity(testing.allocator);
+    defer identity.deinit(testing.allocator);
+    try testing.expect(identity.anchored);
+    try testing.expectEqualStrings("2535000000000001", identity.claims.?.xuid.?);
 }
 
 test "a tampered rsa token signature is refused" {

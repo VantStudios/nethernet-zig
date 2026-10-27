@@ -26,6 +26,7 @@ pub const Submission = struct {
     anchored: bool,
 
     pub fn deinit(self: *Submission, allocator: std.mem.Allocator) void {
+        self.identity.deinit(allocator);
         allocator.free(self.sdp);
         allocator.free(self.idp_domain);
         self.* = undefined;

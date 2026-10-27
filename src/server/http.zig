@@ -14,6 +14,8 @@ const identity_verify = @import("../identity/verify.zig");
 const lan_srv = @import("lan.zig");
 const rate_limit = @import("rate_limit.zig");
 const platform_net = @import("../platform/net.zig");
+const outbox_mod = @import("outbox.zig");
+const session_ids = @import("session_ids.zig");
 
 pub const Config = struct {
     bind_address: std.Io.net.IpAddress = .{ .ip4 = .unspecified(19132) },
@@ -53,6 +55,13 @@ pub const Config = struct {
     identity: ?identity_mod.Provider = null,
     ice_servers: []const peer_mod.IceServer = &.{},
     public_candidate: ?sdp_edit.PublicCandidate = null,
+    /// Shared with every other listener the host runs; a local counter is used when absent.
+    id_source: ?*session_ids.SessionIds = null,
+    /// Where the player count comes from. Defaults to this listener's session count.
+    player_source: ?policy.PlayerSource = null,
+    outbox_slots: usize = 512,
+    outbox_bytes: usize = 256 * 1024,
+    close_deadline_ms: i64 = 2_000,
 };
 
 pub const RateLimitConfig = rate_limit.Config;
@@ -169,6 +178,7 @@ const ActiveSession = struct {
     assembly: framing.Channels,
     scratch: []u8 = &.{},
     identity: ?identity_verify.SessionIdentity = null,
+    outbox: outbox_mod.Outbox,
     slot_index: usize = 0,
     last_progress_ms: i64 = 0,
     opened: bool = false,
@@ -198,6 +208,8 @@ const ActiveSession = struct {
 
     fn deinit(self: *ActiveSession, handler: ?peer_mod.MessageHandler) void {
         if (self.opened) dispatch.closeFor(handler, &self.handle);
+        self.outbox.deinit();
+        if (self.identity) |*identity| identity.deinit(self.allocator);
         self.peer.deinit(self.allocator);
         self.native.deinit();
         self.assembly.deinit();
@@ -222,6 +234,9 @@ pub const Server = struct {
     unverified_warned: std.atomic.Value(bool) = .init(false),
     next_shard: std.atomic.Value(usize) = .init(0),
     next_session_id: std.atomic.Value(u64) = .init(0),
+    /// Reached from any thread; the shard array stays the tick thread's alone.
+    sessions_mutex: std.Io.Mutex = .init,
+    by_id: std.AutoHashMap(u64, *ActiveSession),
     workers: []std.Thread = &.{},
     stopping: std.atomic.Value(bool) = .init(false),
     limiter: ?rate_limit.Limiter = null,
@@ -269,6 +284,7 @@ pub const Server = struct {
             .identity = config.identity orelse identity_mod.Provider.init(io, .{ .cpk_encoding = config.cpk_encoding }),
             .sessions = sessions,
             .shard_locks = shard_locks,
+            .by_id = std.AutoHashMap(u64, *ActiveSession).init(allocator),
             .limiter = limiter,
         };
     }
@@ -280,6 +296,7 @@ pub const Server = struct {
             active.deinit(self.config.handler);
             slot.* = null;
         };
+        self.by_id.deinit();
         self.allocator.free(self.sessions);
         self.allocator.free(self.shard_locks);
         if (self.limiter) |*limiter| limiter.deinit();
@@ -298,12 +315,78 @@ pub const Server = struct {
         return self.player_total.load(.monotonic);
     }
 
+    fn players(self: *const Server) usize {
+        if (self.config.player_source) |source| return source.count(source.ctx);
+        return self.playerCount();
+    }
+
     pub fn verifiedCount(self: *const Server) usize {
         return self.verified_total.load(.monotonic);
     }
 
     pub fn unverifiedCount(self: *const Server) usize {
         return self.unverified_total.load(.monotonic);
+    }
+
+    pub const SendError = outbox_mod.EnqueueError || error{UnknownSession};
+
+    /// Queues a whole message for one session. Thread-safe: it never waits on the
+    /// shard lock, so the game thread cannot be held up by a slow peer.
+    pub fn send(self: *Server, session_id: u64, kind: peer_mod.ChannelKind, payload: []const u8) SendError!void {
+        self.sessions_mutex.lockUncancelable(self.io);
+        defer self.sessions_mutex.unlock(self.io);
+        const active = self.by_id.get(session_id) orelse return error.UnknownSession;
+        return active.outbox.enqueue(outboxKind(kind), payload, active.max_message_size);
+    }
+
+    /// Delivers what is queued, then retires the session. Answers nothing when the id is
+    /// unknown, so a caller that already lost the session does not have to care.
+    pub fn closeSession(self: *Server, session_id: u64) void {
+        const now = peer_mod.nowMs(self.io);
+        self.sessions_mutex.lockUncancelable(self.io);
+        defer self.sessions_mutex.unlock(self.io);
+        const active = self.by_id.get(session_id) orelse return;
+        active.outbox.requestClose(now);
+    }
+
+    pub fn abortSession(self: *Server, session_id: u64) void {
+        self.sessions_mutex.lockUncancelable(self.io);
+        defer self.sessions_mutex.unlock(self.io);
+        const active = self.by_id.get(session_id) orelse return;
+        active.outbox.requestAbort();
+    }
+
+    pub fn sessionMaxMessageSize(self: *Server, session_id: u64) ?u32 {
+        self.sessions_mutex.lockUncancelable(self.io);
+        defer self.sessions_mutex.unlock(self.io);
+        const active = self.by_id.get(session_id) orelse return null;
+        return active.max_message_size;
+    }
+
+    /// Borrowed: the claims stay owned by the session and die with it.
+    pub fn sessionIdentity(self: *Server, session_id: u64) ?identity_verify.SessionIdentity {
+        self.sessions_mutex.lockUncancelable(self.io);
+        defer self.sessions_mutex.unlock(self.io);
+        const active = self.by_id.get(session_id) orelse return null;
+        return active.identity;
+    }
+
+    fn allocateSessionId(self: *Server) u64 {
+        if (self.config.id_source) |source| return source.allocate();
+        return self.next_session_id.fetchAdd(1, .monotonic) +% 1;
+    }
+
+    fn indexSession(self: *Server, active: *ActiveSession) bool {
+        self.sessions_mutex.lockUncancelable(self.io);
+        defer self.sessions_mutex.unlock(self.io);
+        self.by_id.put(active.handle.id, active) catch return false;
+        return true;
+    }
+
+    fn forgetSessionId(self: *Server, active: *const ActiveSession) void {
+        self.sessions_mutex.lockUncancelable(self.io);
+        defer self.sessions_mutex.unlock(self.io);
+        _ = self.by_id.remove(active.handle.id);
     }
 
     pub fn tick(self: *Server) void {
@@ -322,9 +405,7 @@ pub const Server = struct {
             const log_id = logNetworkId(&escaped, active.network_id);
             active.peer.tick() catch |err| {
                 std.log.err("session id={d} networkId={s} tick failed: {s}", .{ active.handle.id, log_id, @errorName(err) });
-                self.noteReleased(active);
-                active.deinit(self.config.handler);
-                slot.* = null;
+                self.releaseShardSlot(slot, active);
                 continue;
             };
 
@@ -356,9 +437,7 @@ pub const Server = struct {
                 .channel_closed => |kind| log.debug("session id={d} networkId={s} channel closed={s}", .{ active.handle.id, log_id, @tagName(kind) }),
                 .failed => |err| {
                     std.log.err("session id={d} networkId={s} peer failure={s}", .{ active.handle.id, log_id, @errorName(err) });
-                    self.noteReleased(active);
-                    active.deinit(self.config.handler);
-                    slot.* = null;
+                    self.releaseShardSlot(slot, active);
                     released = true;
                     break;
                 },
@@ -376,13 +455,15 @@ pub const Server = struct {
                     @tagName(active.peer.stateOf()),
                     now - active.last_progress_ms,
                 });
-                self.noteReleased(active);
-                active.deinit(self.config.handler);
-                slot.* = null;
+                self.releaseShardSlot(slot, active);
                 continue;
             }
 
             self.noteEstablished(active, active.peer.stateOf() == .connected);
+            if (!drainOutbox(active, now, active.peer.stateOf() == .connected)) {
+                std.log.info("closing session id={d} networkId={s}: the session asked to close", .{ active.handle.id, log_id });
+                self.releaseShardSlot(slot, active);
+            }
         };
     }
 
@@ -405,9 +486,15 @@ pub const Server = struct {
             const sessions = self.shardSessions(shard);
             self.shard_locks[shard].lockUncancelable(self.io);
             for (sessions, 0..) |*slot, index| if (slot.* == null) {
+                active.slot_index = index + shard * self.perShard();
+                // Indexed under the shard lock, so a send can never reach a session
+                // that its shard does not own yet.
+                if (!self.indexSession(active)) {
+                    self.shard_locks[shard].unlock(self.io);
+                    return false;
+                }
                 dispatch.openFor(self.config.handler, &active.handle);
                 active.opened = true;
-                active.slot_index = index + shard * self.perShard();
                 slot.* = active;
                 self.notePublished(active);
                 self.shard_locks[shard].unlock(self.io);
@@ -427,7 +514,44 @@ pub const Server = struct {
         if (self.sessions[index] == active) {
             self.sessions[index] = null;
             self.noteReleased(active);
+            self.forgetSessionId(active);
         }
+    }
+
+    /// Clears a shard slot the tick is retiring. Called with the shard lock held.
+    fn releaseShardSlot(self: *Server, slot: *?*ActiveSession, active: *ActiveSession) void {
+        slot.* = null;
+        self.noteReleased(active);
+        self.forgetSessionId(active);
+        active.deinit(self.config.handler);
+    }
+
+    /// Sends what the outbox holds. Returns false once the session asked to close.
+    fn drainOutbox(active: *ActiveSession, now: i64, connected: bool) bool {
+        if (!connected) {
+            // Nothing can leave before the channel is up. A close asked for in that
+            // window drops the queue instead of holding the session open.
+            if (active.outbox.closeRequested()) return false;
+            return true;
+        }
+        while (active.outbox.pop(now)) |entry| {
+            if (entry.close) return false;
+            var label_buffer: [64]u8 = undefined;
+            const label = std.fmt.bufPrint(&label_buffer, "session id={d}", .{active.handle.id}) catch "session";
+            dispatch.sendPacket(
+                active.scratchProvider(),
+                active.max_message_size,
+                &active.handle,
+                peerKind(entry.kind),
+                label,
+                entry.bytes,
+            ) catch |err| {
+                std.log.warn("{s} send failed: {s}", .{ label, @errorName(err) });
+                active.outbox.requestAbort();
+                return true;
+            };
+        }
+        return true;
     }
 
     fn evictNetwork(self: *Server, network_id: []const u8) void {
@@ -439,6 +563,7 @@ pub const Server = struct {
                 if (!std.mem.eql(u8, active.network_id, network_id)) continue;
                 slot.* = null;
                 self.noteReleased(active);
+                self.forgetSessionId(active);
                 evicted = active;
                 break;
             }
@@ -646,7 +771,7 @@ pub const Server = struct {
             @as(u32, @intCast(@min(self.sessions.len, std.math.maxInt(u32))));
         var body: [status_body_bytes]u8 = undefined;
         var writer: std.Io.Writer = .fixed(&body);
-        writeStatusBody(&writer, data, self.playerCount(), capacity) catch |err| switch (err) {
+        writeStatusBody(&writer, data, self.players(), capacity) catch |err| switch (err) {
             error.WriteFailed => {
                 std.log.err("status body does not fit its buffer", .{});
                 return respondStaticStatus(request, .internal_server_error);
@@ -669,14 +794,19 @@ pub const Server = struct {
         // The cap is checked before the claim: a full server must not spend a
         // signature check, or a JWKS fetch, to answer `503`.
         const player_limit = self.config.server_data.max_player_count;
-        const occupied = if (self.config.occupancy) |source| source.count(source.ctx) else self.sessionCount();
+        const occupied = if (self.config.player_source) |source|
+            source.count(source.ctx)
+        else if (self.config.occupancy) |source|
+            source.count(source.ctx)
+        else
+            self.sessionCount();
         if (player_limit > 0 and occupied >= @as(usize, @intCast(player_limit))) {
             std.log.warn("rejecting offer networkId={s}: player limit {d} reached", .{ log_id, player_limit });
             try request.respond("Server is full\n", .{ .status = .service_unavailable, .keep_alive = false });
             return;
         }
 
-        const verified_identity = self.validateClientIdentity(network_id, offer) catch |err| {
+        var verified_identity: ?identity_verify.SessionIdentity = self.validateClientIdentity(network_id, offer) catch |err| {
             std.log.warn("rejecting SDP offer networkId={s}: identity={s}", .{ log_id, @errorName(err) });
             if (err == error.JwksUnavailable) {
                 try request.respond("Identity provider unavailable\n", .{ .status = .service_unavailable, .keep_alive = false });
@@ -689,6 +819,7 @@ pub const Server = struct {
             try request.respond(body, .{ .status = .bad_request, .keep_alive = false });
             return;
         };
+        defer if (verified_identity) |*identity| identity.deinit(self.allocator);
 
         const clean_offer = sdp_identity.withoutIdentity(self.allocator, offer) catch |err| {
             std.log.err("SDP cleanup failed networkId={s}: {s}", .{ log_id, @errorName(err) });
@@ -706,7 +837,10 @@ pub const Server = struct {
         self.evictNetwork(network_id);
 
         var answer_sdp: []const u8 = &.{};
-        const active = self.buildSession(network_id, clean_offer, max_message_size, verified_identity, &answer_sdp) catch |err| {
+        // The session takes the claims from here on, including on a failed setup.
+        const session_identity = verified_identity;
+        verified_identity = null;
+        const active = self.buildSession(network_id, clean_offer, max_message_size, session_identity, &answer_sdp) catch |err| {
             const status = setupFailureStatus(err);
             std.log.err("session setup failed networkId={s}: {s}", .{ log_id, @errorName(err) });
             try request.respond("Session setup failed\n", .{ .status = status, .keep_alive = false });
@@ -761,7 +895,11 @@ pub const Server = struct {
         answer_out: *[]const u8,
     ) !*ActiveSession {
         // Everything acquired below moves into `active` exactly once; only one
-        // error path may release it.
+        // error path may release it. The claims are consumed on entry, so a failed
+        // setup cannot leave them behind.
+        var pending_identity = verified;
+        errdefer if (pending_identity) |*identity| identity.deinit(self.allocator);
+
         const active = try self.allocator.create(ActiveSession);
         var session_ready = false;
         errdefer {
@@ -784,6 +922,15 @@ pub const Server = struct {
         });
         const stored_id = try self.allocator.dupe(u8, network_id);
 
+        var outbox = try outbox_mod.Outbox.init(
+            self.io,
+            self.allocator,
+            self.config.outbox_slots,
+            @max(self.config.outbox_bytes, max_message_size),
+            self.config.close_deadline_ms,
+        );
+        errdefer if (!session_ready) outbox.deinit();
+
         var moved = false;
         errdefer if (!moved) {
             peer.deinit(self.allocator);
@@ -795,14 +942,16 @@ pub const Server = struct {
             .allocator = self.allocator,
             .native = native,
             .peer = peer,
-            .handle = .{ .id = self.next_session_id.fetchAdd(1, .monotonic) + 1, .peer = undefined },
+            .handle = .{ .id = self.allocateSessionId(), .peer = undefined },
             .network_id = stored_id,
             .max_message_size = max_message_size,
             .assembly = framing.Channels.init(self.allocator, max_message_size, self.config.max_packet_bytes),
-            .identity = verified,
+            .identity = pending_identity,
+            .outbox = outbox,
             .last_progress_ms = peer_mod.nowMs(self.io),
         };
         active.handle.peer = &active.peer;
+        pending_identity = null;
         moved = true;
         session_ready = true;
 
@@ -827,7 +976,7 @@ pub const Server = struct {
         if (self.config.identity_policy) |admission| {
             if (!admission.allow(admission.ctx, network_id, &verified.claims)) return error.IdentityRejected;
         }
-        const identity = verified.sessionIdentity();
+        const identity = try verified.sessionIdentity(self.allocator);
         const key_hex = std.fmt.bytesToHex(identity.key_sha256, .lower);
         log.debug("peer identity verified cpk form={s} key sha-256={s}", .{ @tagName(identity.form), key_hex[0..] });
         return identity;
@@ -869,7 +1018,7 @@ pub const Server = struct {
             return error.InvalidIdentity;
         };
         defer identity.deinit(self.allocator);
-        return identity.sessionIdentity();
+        return try identity.sessionIdentity(self.allocator);
     }
 
     fn rateDecision(self: *Server, stream: std.Io.net.Stream) ?rate_limit.Decision {
@@ -999,6 +1148,20 @@ fn previewText(buffer: []u8, data: []const u8) []const u8 {
         out.* = if (byte >= 0x20 and byte < 0x7f) byte else '.';
     }
     return buffer[0..length];
+}
+
+fn outboxKind(kind: peer_mod.ChannelKind) outbox_mod.Kind {
+    return switch (kind) {
+        .reliable => .reliable,
+        .unreliable => .unreliable,
+    };
+}
+
+fn peerKind(kind: outbox_mod.Kind) peer_mod.ChannelKind {
+    return switch (kind) {
+        .reliable => .reliable,
+        .unreliable => .unreliable,
+    };
 }
 
 // Dropped before the HTTP parser sees it: a TLS ClientHello never sends a header

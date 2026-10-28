@@ -30,6 +30,8 @@ pub const Outbox = struct {
         len: usize,
     };
 
+    pub const descriptor_bytes: usize = @sizeOf(Message);
+
     io: std.Io,
     allocator: std.mem.Allocator,
     mutex: std.Io.Mutex = .init,

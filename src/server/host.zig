@@ -31,6 +31,8 @@ pub const Host = struct {
     stopping: std.atomic.Value(bool) = .init(false),
     run_thread: ?std.Thread = null,
 
+    pub const outbox_descriptor_bytes: usize = outbox_mod.Outbox.descriptor_bytes;
+
     pub const Paths = struct {
         http: bool = true,
         lan: bool = true,
@@ -271,6 +273,9 @@ fn httpConfig(config: Host.Config, occupancy: policy.PlayerSource, identity: ide
         .max_sessions = config.http_config.max_sessions,
         .tick_shards = config.http_config.tick_shards,
         .tick_interval_ms = config.http_config.tick_interval_ms,
+        .outbox_slots = config.http_config.outbox_slots,
+        .outbox_bytes = config.http_config.outbox_bytes,
+        .close_deadline_ms = config.http_config.close_deadline_ms,
         .handler = config.handler,
         .max_message_size = config.max_message_size,
         .max_packet_bytes = config.max_packet_bytes,
@@ -303,6 +308,9 @@ fn lanConfig(config: Host.Config, occupancy: policy.PlayerSource, identity: iden
         .bind_retry_ms = config.lan_config.bind_retry_ms,
         .max_bind_attempts = config.lan_config.max_bind_attempts,
         .discovery_replies_per_second = config.lan_config.discovery_replies_per_second,
+        .outbox_slots = config.lan_config.outbox_slots,
+        .outbox_bytes = config.lan_config.outbox_bytes,
+        .close_deadline_ms = config.lan_config.close_deadline_ms,
         .cpk_encoding = config.cpk_encoding,
         .identity = identity,
         .identity_verifier = config.identity_verifier,
@@ -509,11 +517,26 @@ test "the host's http budget reaches the listener" {
         .request_timeout_ms = 5_000,
         .gather_timeout_ms = 3_000,
         .rate_limit = .{ .joins_per_minute = 30, .burst = 2 },
+        .outbox_slots = 300,
+        .outbox_bytes = 128 * 1024,
+        .close_deadline_ms = 1_234,
     } }, occupancy, provider);
     try std.testing.expectEqual(@as(usize, 4), configured.max_concurrent_requests);
     try std.testing.expectEqual(@as(i64, 5_000), configured.request_timeout_ms);
     try std.testing.expectEqual(@as(i64, 3_000), configured.gather_timeout_ms);
     try std.testing.expectEqual(@as(u32, 2), configured.rate_limit.?.burst);
+    try std.testing.expectEqual(@as(usize, 300), configured.outbox_slots);
+    try std.testing.expectEqual(@as(usize, 128 * 1024), configured.outbox_bytes);
+    try std.testing.expectEqual(@as(i64, 1_234), configured.close_deadline_ms);
+
+    const configured_lan = lanConfig(.{ .lan_config = .{
+        .outbox_slots = 300,
+        .outbox_bytes = 128 * 1024,
+        .close_deadline_ms = 1_234,
+    } }, occupancy, provider);
+    try std.testing.expectEqual(@as(usize, 300), configured_lan.outbox_slots);
+    try std.testing.expectEqual(@as(usize, 128 * 1024), configured_lan.outbox_bytes);
+    try std.testing.expectEqual(@as(i64, 1_234), configured_lan.close_deadline_ms);
 }
 
 test "a host that requires an identity refuses to start without one" {

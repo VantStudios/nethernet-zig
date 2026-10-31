@@ -185,6 +185,11 @@ pub const Host = struct {
         return count;
     }
 
+    pub fn signalingPort(self: *const Host) u16 {
+        const server = self.http orelse return 0;
+        return server.signalingPort();
+    }
+
     pub const SendError = outbox_mod.EnqueueError || error{UnknownSession};
 
     /// Queues a message for a session whichever path it came in on. Thread-safe, and it
@@ -315,6 +320,7 @@ fn lanConfig(config: Host.Config, occupancy: policy.PlayerSource, identity: iden
         .identity = identity,
         .identity_verifier = config.identity_verifier,
         .identity_policy = config.identity_policy,
+        .accept_unverified_identity = config.accept_unverified_identity or config.lan_config.accept_unverified_identity,
         .require_identity = config.require_client_identity orelse config.lan_config.require_identity,
         .ice_servers = config.ice_servers,
         .public_candidate = config.public_candidate,
@@ -499,6 +505,10 @@ test "the host's client identity requirement reaches both listeners" {
     try std.testing.expect(httpConfig(.{ .accept_unverified_identity = true }, occupancy, provider).accept_unverified_identity);
     try std.testing.expect(httpConfig(.{ .http_config = .{ .accept_unverified_identity = true } }, occupancy, provider).accept_unverified_identity);
     try std.testing.expectEqual(@as(usize, 1024), httpConfig(.{ .http_config = .{ .max_identity_bytes = 1024 } }, occupancy, provider).max_identity_bytes);
+
+    try std.testing.expect(!lanConfig(.{}, occupancy, provider).accept_unverified_identity);
+    try std.testing.expect(lanConfig(.{ .accept_unverified_identity = true }, occupancy, provider).accept_unverified_identity);
+    try std.testing.expect(lanConfig(.{ .lan_config = .{ .accept_unverified_identity = true } }, occupancy, provider).accept_unverified_identity);
 }
 
 test "the host's http budget reaches the listener" {

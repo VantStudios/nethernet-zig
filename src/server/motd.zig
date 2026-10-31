@@ -228,7 +228,7 @@ fn buildPong(config: Config, frame: []const u8, buffer: []u8) ?[]const u8 {
         gameModeName(data.game_type),
         @intFromEnum(data.game_type),
         config.port,
-        config.port + 1,
+        config.port,
     }) catch return null;
     const motd = motd_writer.buffered();
 
@@ -334,7 +334,7 @@ test "RakNet pong echoes the ping time and carries the MOTD" {
     try std.testing.expectEqual(@as(usize, motd_length), pong.len - 35);
     const motd = pong[35..];
     try std.testing.expect(std.mem.startsWith(u8, motd, "MCPE;Motd test server;4422;1.26.60;3;8;"));
-    try std.testing.expect(std.mem.endsWith(u8, motd, ";Creative;1;19132;19133;"));
+    try std.testing.expect(std.mem.endsWith(u8, motd, ";Creative;1;19132;19132;"));
     try std.testing.expectEqual(@as(usize, 12), std.mem.count(u8, motd, ";"));
 }
 
@@ -370,7 +370,7 @@ test "the MOTD repeats its ServerData and prefers the live player count" {
     var expected_buffer: [256]u8 = undefined;
     const expected = try std.fmt.bufPrint(
         &expected_buffer,
-        "MCPE;shared;{d};{s};7;12;{d};shared-level;Adventure;2;19132;19133;",
+        "MCPE;shared;{d};{s};7;12;{d};shared-level;Adventure;2;19132;19132;",
         .{
             discovery.advertised_build.protocol,
             discovery.advertised_build.game_version,

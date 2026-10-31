@@ -924,19 +924,35 @@ pub const NativePeerConnection = struct {
                 const incoming = socket.receive(self.io, &buffer) catch break;
                 const datagram = incoming orelse break;
                 const from = datagram.from;
-                const result = self.connection.handleRead(.{
-                    .data = datagram.data,
-                    .from = &from,
-                    .to = &socket.address,
-                }, now) catch continue;
-                switch (result) {
-                    .app_data => |iterator| {
-                        var messages = iterator;
-                        self.drainAppData(&messages) catch return error.OutOfMemory;
-                    },
-                    else => {},
-                }
+                try self.receiveDatagram(datagram.data, &from, &socket.address, now);
             }
+        }
+    }
+
+    fn receiveDatagram(self: *NativePeerConnection, data: []const u8, from: *const std.Io.net.IpAddress, to: *const std.Io.net.IpAddress, now: i64) PeerError!void {
+        // The backend reads one DTLS record per handleRead. Split coalesced
+        // records before handing them over, otherwise the remaining records stay
+        // inside mbedTLS until another datagram arrives and can be lost.
+        var remaining = data;
+        while (remaining.len != 0) {
+            const length = datagramRecordLength(remaining) orelse return;
+            const record = remaining[0..length];
+            remaining = remaining[length..];
+            const result = self.connection.handleRead(.{
+                .data = record,
+                .from = from,
+                .to = to,
+            }, now) catch continue;
+            switch (result) {
+                .app_data => |iterator| {
+                    var messages = iterator;
+                    try self.drainAppData(&messages);
+                },
+                else => {},
+            }
+            // SCTP HEARTBEAT ACKs borrow the decrypted input. Flush before
+            // processing another record, including one in the same datagram.
+            try self.transmit(now);
         }
     }
 
@@ -1098,6 +1114,34 @@ pub const NativePeerConnection = struct {
         .pollLocalCandidate = pollLocalCandidate,
     };
 };
+
+/// DTLS 1.2 uses a 13-byte record header; STUN/TURN and media datagrams
+/// retain their boundaries. A truncated record must never reach the backend BIO.
+fn datagramRecordLength(data: []const u8) ?usize {
+    if (data.len == 0) return null;
+    if (data[0] < 20 or data[0] > 63) return data.len;
+    if (data.len < 13) return null;
+    const length = 13 + @as(usize, std.mem.readInt(u16, data[11..13], .big));
+    return if (length <= data.len) length else null;
+}
+
+test "DTLS record boundaries reject truncation and preserve non-DTLS datagrams" {
+    try std.testing.expect(datagramRecordLength(&.{}) == null);
+    try std.testing.expect(datagramRecordLength(&.{23}) == null);
+    var record: [16]u8 = @splat(0);
+    record[0] = 23;
+    std.mem.writeInt(u16, record[11..13], 3, .big);
+    try std.testing.expectEqual(@as(?usize, 16), datagramRecordLength(&record));
+    try std.testing.expect(datagramRecordLength(record[0..15]) == null);
+    const coalesced = record ++ record;
+    try std.testing.expectEqual(@as(?usize, 16), datagramRecordLength(&coalesced));
+    record[0] = 0; // STUN
+    try std.testing.expectEqual(@as(?usize, 16), datagramRecordLength(&record));
+    record[0] = 0x80; // RTP/RTCP
+    try std.testing.expectEqual(@as(?usize, 16), datagramRecordLength(&record));
+    record[0] = 0x40; // TURN ChannelData
+    try std.testing.expectEqual(@as(?usize, 16), datagramRecordLength(&record));
+}
 
 fn isIpv6LinkLocal(address: std.Io.net.IpAddress) bool {
     return switch (address) {
@@ -1442,6 +1486,172 @@ test "native peer connections complete an in-process data-channel loopback" {
 
     try std.testing.expect(connected);
     try std.testing.expect(received);
+}
+
+test "native receive preserves heartbeat acknowledgements across queued datagrams" {
+    const io = std.testing.io;
+    const allocator = std.testing.allocator;
+    const config: PeerConfig = .{ .profile = .http_full_ice };
+    const offer_backend = try NativePeerConnection.init(io, allocator, config);
+    defer offer_backend.deinit();
+    const answer_backend = try NativePeerConnection.init(io, allocator, config);
+    defer answer_backend.deinit();
+
+    for ([_]*NativePeerConnection{ offer_backend, answer_backend }) |backend| {
+        backend.sockets[0] = try dgram.Socket.bind(io, .{ .ip4 = .loopback(0) });
+        backend.socket_addrs[0] = backend.sockets[0].address;
+        backend.socket_count = 1;
+        backend.local_bound = true;
+        try backend.connection.addLocalCandidates(backend.socket_addrs[0..1], nowMs(io));
+    }
+    var offer_peer = try Peer.init(allocator, offer_backend.connectionSpi(), config);
+    defer offer_peer.deinit(allocator);
+    var answer_peer = try Peer.init(allocator, answer_backend.connectionSpi(), config);
+    defer answer_peer.deinit(allocator);
+
+    const offer = try offer_peer.startOffer();
+    const answer = try answer_peer.acceptOffer(offer);
+    try offer_peer.acceptAnswer(answer);
+    const deadline = nowMs(io) + 5_000;
+    while (offer_peer.stateOf() != .connected or answer_peer.stateOf() != .connected) {
+        try std.testing.expect(nowMs(io) < deadline);
+        try offer_peer.tick();
+        try answer_peer.tick();
+        while (offer_peer.pollEvent()) |_| {}
+        while (answer_peer.pollEvent()) |_| {}
+        try io.sleep(.fromMilliseconds(1), .awake);
+    }
+    // Finish the DCEP acknowledgements before injecting SCTP control packets.
+    for (0..10) |_| {
+        try offer_peer.tick();
+        try answer_peer.tick();
+        while (offer_peer.pollEvent()) |_| {}
+        while (answer_peer.pollEvent()) |_| {}
+        try io.sleep(.fromMilliseconds(1), .awake);
+    }
+
+    const Crc32c = std.hash.crc.Crc(u32, .{
+        .polynomial = 0x1edc6f41,
+        .initial = 0xffffffff,
+        .reflect_input = true,
+        .reflect_output = true,
+        .xor_output = 0xffffffff,
+    });
+    var packet: [28]u8 = @splat(0);
+    const assoc = &answer_backend.connection.sctp_transport.assoc;
+    std.mem.writeInt(u16, packet[0..2], assoc.dest_port, .big);
+    std.mem.writeInt(u16, packet[2..4], assoc.source_port, .big);
+    std.mem.writeInt(u32, packet[4..8], assoc.verification_tag, .big);
+    packet[12] = 4; // HEARTBEAT
+    std.mem.writeInt(u16, packet[14..16], 16, .big);
+    std.mem.writeInt(u16, packet[16..18], 1, .big); // Heartbeat Info parameter
+    std.mem.writeInt(u16, packet[18..20], 12, .big);
+    const tokens = [_][]const u8{ "original", "replaced" };
+    var wire: [NativePeerConnection.datagram_bytes]u8 = undefined;
+    for (tokens) |token| {
+        @memcpy(packet[20..28], token);
+        @memset(packet[8..12], 0);
+        std.mem.writeInt(u32, packet[8..12], Crc32c.hash(&packet), .little);
+        const encrypted = offer_backend.connection.dtls_transport.handleWrite(&packet, &wire);
+        try offer_backend.sockets[0].send(io, &answer_backend.socket_addrs[0], encrypted);
+    }
+
+    var acknowledged: usize = 0;
+    const ack_deadline = nowMs(io) + 1_000;
+    while (acknowledged < tokens.len and nowMs(io) < ack_deadline) {
+        // Both heartbeats can be queued before one pump; their opaque bytes must
+        // survive reuse of the backend's decrypted input buffer.
+        try answer_backend.pumpIo(nowMs(io));
+        while (try offer_backend.sockets[0].receive(io, &wire)) |datagram| {
+            var plain: [NativePeerConnection.datagram_bytes]u8 = undefined;
+            const from = datagram.from;
+            const event = try offer_backend.connection.dtls_transport.handleRead(.{
+                .data = datagram.data,
+                .from = &from,
+                .to = &offer_backend.socket_addrs[0],
+            }, nowMs(io), &plain) orelse continue;
+            switch (event) {
+                .app_data => |data| {
+                    if (data.len < 28 or data[12] != 5) continue; // HEARTBEAT ACK
+                    try std.testing.expect(acknowledged < tokens.len);
+                    try std.testing.expectEqualStrings(tokens[acknowledged], data[20..28]);
+                    acknowledged += 1;
+                },
+                else => {},
+            }
+        }
+        if (acknowledged < tokens.len) try io.sleep(.fromMilliseconds(1), .awake);
+    }
+    try std.testing.expectEqual(tokens.len, acknowledged);
+}
+
+test "native receive delivers every DTLS record in one UDP datagram" {
+    const io = std.testing.io;
+    const allocator = std.testing.allocator;
+    const config: PeerConfig = .{ .profile = .http_full_ice };
+    const offer_backend = try NativePeerConnection.init(io, allocator, config);
+    defer offer_backend.deinit();
+    const answer_backend = try NativePeerConnection.init(io, allocator, config);
+    defer answer_backend.deinit();
+
+    for ([_]*NativePeerConnection{ offer_backend, answer_backend }) |backend| {
+        backend.sockets[0] = try dgram.Socket.bind(io, .{ .ip4 = .loopback(0) });
+        backend.socket_addrs[0] = backend.sockets[0].address;
+        backend.socket_count = 1;
+        backend.local_bound = true;
+        try backend.connection.addLocalCandidates(backend.socket_addrs[0..1], nowMs(io));
+    }
+    var offer_peer = try Peer.init(allocator, offer_backend.connectionSpi(), config);
+    defer offer_peer.deinit(allocator);
+    var answer_peer = try Peer.init(allocator, answer_backend.connectionSpi(), config);
+    defer answer_peer.deinit(allocator);
+
+    const offer = try offer_peer.startOffer();
+    const answer = try answer_peer.acceptOffer(offer);
+    try offer_peer.acceptAnswer(answer);
+    const deadline = nowMs(io) + 5_000;
+    while (offer_peer.stateOf() != .connected or answer_peer.stateOf() != .connected) {
+        try std.testing.expect(nowMs(io) < deadline);
+        try offer_peer.tick();
+        try answer_peer.tick();
+        while (offer_peer.pollEvent()) |_| {}
+        while (answer_peer.pollEvent()) |_| {}
+        try io.sleep(.fromMilliseconds(1), .awake);
+    }
+    for (0..10) |_| {
+        try offer_peer.tick();
+        try answer_peer.tick();
+        while (offer_peer.pollEvent()) |_| {}
+        while (answer_peer.pollEvent()) |_| {}
+        try io.sleep(.fromMilliseconds(1), .awake);
+    }
+
+    var datagram: [NativePeerConnection.datagram_bytes]u8 = undefined;
+    var used: usize = 0;
+    const payloads = [_][]const u8{ "first record", "second record" };
+    for (payloads) |payload| {
+        try offer_peer.send(.reliable, payload);
+        var wire: [NativePeerConnection.datagram_bytes]u8 = undefined;
+        const outgoing = (try offer_backend.connection.pollTransmit(&wire, nowMs(io))).?;
+        @memcpy(datagram[used..][0..outgoing.data.len], outgoing.data);
+        used += outgoing.data.len;
+    }
+    try offer_backend.sockets[0].send(io, &answer_backend.socket_addrs[0], datagram[0..used]);
+    var received: usize = 0;
+    const receive_deadline = nowMs(io) + 300;
+    while (received < payloads.len and nowMs(io) < receive_deadline) {
+        try answer_peer.tick();
+        while (answer_peer.pollEvent()) |event| switch (event) {
+            .binary => |msg| {
+                try std.testing.expect(received < payloads.len);
+                try std.testing.expectEqualStrings(payloads[received], msg.data);
+                received += 1;
+            },
+            else => {},
+        };
+        try io.sleep(.fromMilliseconds(1), .awake);
+    }
+    try std.testing.expectEqual(payloads.len, received);
 }
 
 test "peer reaches connected only after both channels open" {

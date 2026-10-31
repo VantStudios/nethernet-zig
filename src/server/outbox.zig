@@ -12,8 +12,9 @@ pub const EnqueueError = error{ Closed, Backpressure, PayloadTooLarge };
 /// queue.
 ///
 /// The slab is linear: messages are appended and the whole slab is reclaimed whenever
-/// the queue empties, plus a compaction pass once the high-water mark passes half. A
-/// popped slice stays valid until the next `pop`, which is all the drain loop needs.
+/// the queue empties, plus a compaction pass once the high-water mark passes half.
+/// Reclamation happens at the start of the next `pop`: the returned slice must stay
+/// valid while the consumer sends it, including across concurrent enqueues.
 ///
 /// The slab is allocated on the first send, so a session that never sends costs only
 /// its ring.
@@ -114,6 +115,15 @@ pub const Outbox = struct {
         defer self.mutex.unlock(self.io);
 
         if (self.close_sent) return null;
+
+        // The previous pop's slice is no longer borrowed. Reclaim only here, never
+        // after selecting this pop's message or from a concurrent producer.
+        if (self.count == 0) {
+            self.clearLocked();
+        } else if (self.used >= self.slab.len / 2) {
+            self.compactLocked();
+        }
+
         if (self.aborting) {
             // An abort still has to reach the transport, which is what closes the peer.
             self.clearLocked();
@@ -137,11 +147,6 @@ pub const Outbox = struct {
         const message = self.messages[self.head];
         self.head = (self.head + 1) % self.messages.len;
         self.count -= 1;
-        if (self.count == 0) {
-            self.clearLocked();
-        } else if (self.used >= self.slab.len / 2) {
-            self.compactLocked();
-        }
         return .{ .kind = message.kind, .bytes = self.slab[message.offset..][0..message.len] };
     }
 
@@ -167,7 +172,7 @@ pub const Outbox = struct {
     pub fn pendingBytes(self: *Outbox) usize {
         self.mutex.lockUncancelable(self.io);
         defer self.mutex.unlock(self.io);
-        return self.used;
+        return if (self.count == 0) 0 else self.used;
     }
 
     pub fn droppedCount(self: *Outbox) usize {
@@ -237,6 +242,56 @@ test "messages pop in the order they were queued" {
     try testing.expectEqualStrings("third", third.bytes);
     try testing.expect(outbox.pop(0) == null);
     try testing.expect(outbox.isEmpty());
+}
+
+test "compaction preserves the message returned by pop" {
+    var outbox = try testOutbox(testing.allocator, 4, 16);
+    defer outbox.deinit();
+
+    try outbox.enqueue(.reliable, "first", 16);
+    try outbox.enqueue(.unreliable, "second", 16);
+
+    const first = outbox.pop(0).?;
+    try testing.expectEqualStrings("first", first.bytes);
+    try testing.expectEqual(Kind.reliable, first.kind);
+    try testing.expectEqualStrings("second", outbox.pop(0).?.bytes);
+    try testing.expect(outbox.pop(0) == null);
+}
+
+test "an enqueue from another thread preserves the last popped message" {
+    var outbox = try testOutbox(testing.allocator, 4, 16);
+    defer outbox.deinit();
+
+    try outbox.enqueue(.reliable, "first", 16);
+    const first = outbox.pop(0).?;
+
+    const Producer = struct {
+        fn run(queue: *Outbox) void {
+            queue.enqueue(.unreliable, "second", 16) catch unreachable;
+        }
+    };
+    const thread = try std.Thread.spawn(.{}, Producer.run, .{&outbox});
+    thread.join();
+
+    try testing.expectEqualStrings("first", first.bytes);
+    try testing.expectEqualStrings("second", outbox.pop(0).?.bytes);
+    try testing.expect(outbox.pop(0) == null);
+}
+
+test "a full slab remains borrowed until the next pop" {
+    var outbox = try testOutbox(testing.allocator, 4, 8);
+    defer outbox.deinit();
+
+    try outbox.enqueue(.reliable, "12345678", 8);
+    const message = outbox.pop(0).?;
+    try testing.expect(outbox.isEmpty());
+    try testing.expectEqual(@as(usize, 0), outbox.pendingBytes());
+    try testing.expectError(error.Backpressure, outbox.enqueue(.reliable, "next", 8));
+    try testing.expectEqualStrings("12345678", message.bytes);
+
+    try testing.expect(outbox.pop(0) == null);
+    try outbox.enqueue(.reliable, "next", 8);
+    try testing.expectEqualStrings("next", outbox.pop(0).?.bytes);
 }
 
 test "a full queue refuses without dropping what it holds" {

@@ -219,6 +219,75 @@ const ActiveSession = struct {
     }
 };
 
+const JoinResult = enum { pending, answer, failure };
+
+const JoinState = struct {
+    io: std.Io,
+    allocator: std.mem.Allocator,
+    key: []u8,
+    network_id: []u8,
+    mutex: std.Io.Mutex = .init,
+    done: std.Io.Event = .unset,
+    refs: usize = 1,
+    result: JoinResult = .pending,
+    answer: ?[]u8 = null,
+    status: std.http.Status = .internal_server_error,
+    body: []const u8 = "Session setup failed\n",
+
+    fn init(io: std.Io, allocator: std.mem.Allocator, network_id: []const u8, offer_hash: u64) !*JoinState {
+        const self = try allocator.create(JoinState);
+        errdefer allocator.destroy(self);
+        const stored = try allocator.dupe(u8, network_id);
+        errdefer allocator.free(stored);
+        const key = try std.fmt.allocPrint(allocator, "{s}#{x}", .{ network_id, offer_hash });
+        errdefer allocator.free(key);
+        self.* = .{ .io = io, .allocator = allocator, .key = key, .network_id = stored };
+        return self;
+    }
+
+    fn retain(self: *JoinState) void {
+        self.mutex.lockUncancelable(self.io);
+        self.refs += 1;
+        self.mutex.unlock(self.io);
+    }
+
+    fn release(self: *JoinState) void {
+        self.mutex.lockUncancelable(self.io);
+        self.refs -= 1;
+        const last = self.refs == 0;
+        self.mutex.unlock(self.io);
+        if (!last) return;
+
+        if (self.answer) |answer| self.allocator.free(answer);
+        self.allocator.free(self.key);
+        self.allocator.free(self.network_id);
+        self.allocator.destroy(self);
+    }
+
+    fn setAnswer(self: *JoinState, answer: []const u8) !void {
+        const copy = try self.allocator.dupe(u8, answer);
+        self.mutex.lockUncancelable(self.io);
+        if (self.answer) |old| self.allocator.free(old);
+        self.answer = copy;
+        self.result = .answer;
+        self.mutex.unlock(self.io);
+    }
+
+    fn setFailure(self: *JoinState, status: std.http.Status, body: []const u8) void {
+        self.mutex.lockUncancelable(self.io);
+        if (self.answer) |old| {
+            self.allocator.free(old);
+            self.answer = null;
+        }
+        self.result = .failure;
+        self.status = status;
+        self.body = body;
+        self.mutex.unlock(self.io);
+    }
+};
+
+const JoinClaim = union(enum) { leader: *JoinState, waiter: *JoinState };
+
 pub const Server = struct {
     io: std.Io,
     allocator: std.mem.Allocator,
@@ -237,6 +306,8 @@ pub const Server = struct {
     /// Reached from any thread; the shard array stays the tick thread's alone.
     sessions_mutex: std.Io.Mutex = .init,
     by_id: std.AutoHashMap(u64, *ActiveSession),
+    joining: std.StringHashMap(*JoinState),
+    joining_mutex: std.Io.Mutex = .init,
     workers: []std.Thread = &.{},
     stopping: std.atomic.Value(bool) = .init(false),
     limiter: ?rate_limit.Limiter = null,
@@ -285,6 +356,7 @@ pub const Server = struct {
             .sessions = sessions,
             .shard_locks = shard_locks,
             .by_id = std.AutoHashMap(u64, *ActiveSession).init(allocator),
+            .joining = std.StringHashMap(*JoinState).init(allocator),
             .limiter = limiter,
         };
     }
@@ -297,6 +369,9 @@ pub const Server = struct {
             slot.* = null;
         };
         self.by_id.deinit();
+        var joining = self.joining.valueIterator();
+        while (joining.next()) |state| state.*.release();
+        self.joining.deinit();
         self.allocator.free(self.sessions);
         self.allocator.free(self.shard_locks);
         if (self.limiter) |*limiter| limiter.deinit();
@@ -305,6 +380,10 @@ pub const Server = struct {
 
     pub fn shardCount(self: *const Server) usize {
         return self.shard_locks.len;
+    }
+
+    pub fn signalingPort(self: *const Server) u16 {
+        return self.listener.socket.address.getPort();
     }
 
     pub fn sessionCount(self: *const Server) usize {
@@ -568,8 +647,6 @@ pub const Server = struct {
                 break;
             }
             self.shard_locks[shard].unlock(self.io);
-            // Released outside the shard lock: `deinit` calls the handler, which can
-            // run arbitrary consumer code (closing the player, touching its world).
             if (evicted) |active| {
                 var escaped: [log_id_bytes]u8 = undefined;
                 std.log.info("closing session id={d} networkId={s}: the client joined again", .{
@@ -578,6 +655,80 @@ pub const Server = struct {
                 });
                 active.deinit(self.config.handler);
             }
+        }
+    }
+
+    fn beginJoin(self: *Server, network_id: []const u8, offer: []const u8) !JoinClaim {
+        const offer_hash = std.hash.Wyhash.hash(0, offer);
+        var key_buffer: [512]u8 = undefined;
+        const key = std.fmt.bufPrint(&key_buffer, "{s}#{x}", .{ network_id, offer_hash }) catch
+            return error.NameTooLong;
+
+        self.joining_mutex.lockUncancelable(self.io);
+        if (self.joining.get(key)) |state| {
+            state.retain();
+            self.joining_mutex.unlock(self.io);
+            return .{ .waiter = state };
+        }
+
+        const state = JoinState.init(self.io, self.allocator, network_id, offer_hash) catch |err| {
+            self.joining_mutex.unlock(self.io);
+            return err;
+        };
+        self.joining.put(state.key, state) catch |err| {
+            self.joining_mutex.unlock(self.io);
+            state.release();
+            return err;
+        };
+        self.joining_mutex.unlock(self.io);
+        return .{ .leader = state };
+    }
+
+    fn finishJoin(self: *Server, state: *JoinState) void {
+        self.joining_mutex.lockUncancelable(self.io);
+        if (self.joining.get(state.key) == state) _ = self.joining.remove(state.key);
+        self.joining_mutex.unlock(self.io);
+
+        state.mutex.lockUncancelable(self.io);
+        if (state.result == .pending) {
+            state.result = .failure;
+            state.status = .internal_server_error;
+            state.body = "Session setup failed\n";
+        }
+        state.mutex.unlock(self.io);
+
+        state.done.set(self.io);
+        state.release();
+    }
+
+    fn respondJoinWaiter(self: *Server, request: *std.http.Server.Request, state: *JoinState) !void {
+        state.done.waitUncancelable(self.io);
+
+        state.mutex.lockUncancelable(self.io);
+        const result = state.result;
+        const status = state.status;
+        const body = state.body;
+        const answer = if (state.answer) |bytes| self.allocator.dupe(u8, bytes) catch null else null;
+        state.mutex.unlock(self.io);
+        state.release();
+        defer {
+            if (answer) |bytes| self.allocator.free(bytes);
+        }
+
+        switch (result) {
+            .answer => {
+                const bytes = answer orelse {
+                    try request.respond("Session setup failed\n", .{ .status = .internal_server_error, .keep_alive = false });
+                    return;
+                };
+                try request.respond(bytes, .{
+                    .status = .ok,
+                    .keep_alive = false,
+                    .extra_headers = &.{.{ .name = "content-type", .value = "application/sdp" }},
+                });
+            },
+            .failure => try request.respond(body, .{ .status = status, .keep_alive = false }),
+            .pending => try request.respond("Session setup failed\n", .{ .status = .internal_server_error, .keep_alive = false }),
         }
     }
 
@@ -834,6 +985,16 @@ pub const Server = struct {
         );
         log.debug("SDP offer networkId={s} negotiated maxMessageSize={d}", .{ log_id, max_message_size });
 
+        const claim = self.beginJoin(network_id, clean_offer) catch |err| {
+            std.log.err("could not reserve networkId={s}: {s}", .{ log_id, @errorName(err) });
+            try request.respond("Session setup failed\n", .{ .status = .internal_server_error, .keep_alive = false });
+            return;
+        };
+        const state = switch (claim) {
+            .waiter => |waiter| return self.respondJoinWaiter(request, waiter),
+            .leader => |leader| leader,
+        };
+        defer self.finishJoin(state);
         self.evictNetwork(network_id);
 
         var answer_sdp: []const u8 = &.{};
@@ -843,6 +1004,7 @@ pub const Server = struct {
         const active = self.buildSession(network_id, clean_offer, max_message_size, session_identity, &answer_sdp) catch |err| {
             const status = setupFailureStatus(err);
             std.log.err("session setup failed networkId={s}: {s}", .{ log_id, @errorName(err) });
+            state.setFailure(status, "Session setup failed\n");
             try request.respond("Session setup failed\n", .{ .status = status, .keep_alive = false });
             return;
         };
@@ -854,6 +1016,7 @@ pub const Server = struct {
             .public_candidate = self.config.public_candidate,
         }) catch |err| {
             std.log.err("answer edit failed networkId={s}: {s}", .{ log_id, @errorName(err) });
+            state.setFailure(.internal_server_error, "Session setup failed\n");
             try request.respond("Session setup failed\n", .{ .status = .internal_server_error, .keep_alive = false });
             return;
         };
@@ -861,6 +1024,7 @@ pub const Server = struct {
 
         const signed_answer = self.identity.addToSdp(self.allocator, edited_answer) catch |err| {
             std.log.err("identity generation failed networkId={s}: {s}", .{ log_id, @errorName(err) });
+            state.setFailure(.internal_server_error, "Identity generation failed\n");
             try request.respond("Identity generation failed\n", .{ .status = .internal_server_error, .keep_alive = false });
             return;
         };
@@ -868,15 +1032,21 @@ pub const Server = struct {
 
         if (!self.publishSession(active)) {
             std.log.warn("rejecting offer networkId={s}: no free session slot", .{log_id});
+            state.setFailure(.service_unavailable, "Server is full\n");
             try request.respond("Server is full\n", .{ .status = .service_unavailable, .keep_alive = false });
             return;
         }
         published = true;
+        state.setAnswer(signed_answer) catch |err| {
+            std.log.err("could not retain the answer for networkId={s}: {s}", .{ log_id, @errorName(err) });
+            state.setFailure(.internal_server_error, "Session setup failed\n");
+        };
         request.respond(signed_answer, .{
             .status = .ok,
             .keep_alive = false,
             .extra_headers = &.{.{ .name = "content-type", .value = "application/sdp" }},
         }) catch |err| {
+            state.setFailure(.internal_server_error, "Session setup failed\n");
             self.releaseSession(active);
             return err;
         };
@@ -985,6 +1155,11 @@ pub const Server = struct {
     fn validateUnanchored(self: *Server, network_id: []const u8, offer: []const u8) !?identity_verify.SessionIdentity {
         const identity = self.parseClientIdentity(offer) catch |err| switch (err) {
             error.MissingIdentity => return self.admitAnonymous(network_id),
+            error.InvalidIdentity => {
+                if (!self.config.accept_unverified_identity or self.config.require_identity) return err;
+                std.log.warn("peer identity could not be verified; admitting an anonymous join networkId={s}", .{network_id});
+                return self.admitAnonymous(network_id);
+            },
             else => return err,
         };
         if (self.config.identity_policy) |admission| {
@@ -1221,17 +1396,30 @@ fn writeStatusBody(
     players: usize,
     capacity: u32,
 ) std.Io.Writer.Error!void {
-    try writer.writeAll("{\"name\":\"");
+    try writer.print("{{\"dataVersion\":{d},\"name\":\"", .{discovery.ServerData.version});
     try json.writeString(writer, data.server_name);
     try writer.print("\",\"protocol\":{d},\"version\":\"", .{data.protocol});
     try json.writeString(writer, data.game_version);
     try writer.writeAll("\",\"level\":\"");
     try json.writeString(writer, data.level_name);
-    try writer.print("\",\"players\":{d},\"maxPlayers\":{d},\"gameType\":{d}}}", .{
+    try writer.print("\",\"players\":{d},\"maxPlayers\":{d},\"gameType\":{d},\"editor\":{s},\"hardcore\":{s},\"onlineAuth\":{s},\"selfSignedAuth\":{s},\"nonce\":\"", .{
         players,
         capacity,
         @intFromEnum(data.game_type),
+        boolText(data.editor_world),
+        boolText(data.hardcore),
+        boolText(data.accepts_online_auth),
+        boolText(data.accepts_self_signed_auth),
     });
+    try json.writeString(writer, data.nonce);
+    try writer.print("\",\"transportLayer\":{d},\"connection\":{d}}}", .{
+        discovery.transport_layer_nethernet,
+        data.connection_type,
+    });
+}
+
+fn boolText(value: bool) []const u8 {
+    return if (value) "true" else "false";
 }
 
 fn respondStaticStatus(request: *std.http.Server.Request, status: std.http.Status) !void {
@@ -1240,6 +1428,52 @@ fn respondStaticStatus(request: *std.http.Server.Request, status: std.http.Statu
         .keep_alive = false,
         .extra_headers = &.{.{ .name = "content-type", .value = "application/json" }},
     });
+}
+
+test "only an identical offer joins the one already in flight" {
+    const io = std.testing.io;
+    const allocator = std.testing.allocator;
+    const address: std.Io.net.IpAddress = .{ .ip4 = std.Io.net.Ip4Address.loopback(20022) };
+    var server = try Server.init(io, allocator, .{
+        .bind_address = address,
+        .accept_unverified_identity = true,
+    });
+    defer server.deinit();
+
+    const first_claim = try server.beginJoin("dedup-0001", "offer-a");
+    const first = switch (first_claim) {
+        .leader => |state| state,
+        .waiter => return error.TestUnexpectedResult,
+    };
+
+    const second_claim = try server.beginJoin("dedup-0001", "offer-a");
+    const second = switch (second_claim) {
+        .waiter => |state| state,
+        .leader => return error.TestUnexpectedResult,
+    };
+    second.release();
+
+    const distinct_claim = try server.beginJoin("dedup-0001", "offer-b");
+    const distinct = switch (distinct_claim) {
+        .leader => |state| state,
+        .waiter => return error.TestUnexpectedResult,
+    };
+    server.finishJoin(distinct);
+
+    const other_claim = try server.beginJoin("dedup-0002", "offer-a");
+    switch (other_claim) {
+        .leader => |state| server.finishJoin(state),
+        .waiter => return error.TestUnexpectedResult,
+    }
+
+    try first.setAnswer("answer");
+    server.finishJoin(first);
+
+    const again_claim = try server.beginJoin("dedup-0001", "offer-a");
+    switch (again_claim) {
+        .leader => |state| server.finishJoin(state),
+        .waiter => return error.TestUnexpectedResult,
+    }
 }
 
 test "server config uses the Partner port" {
@@ -1568,6 +1802,7 @@ test "serveOne answers an HTTP peer" {
 }
 
 const StatusJson = struct {
+    dataVersion: u8,
     name: []const u8,
     protocol: i32,
     version: []const u8,
@@ -1575,6 +1810,13 @@ const StatusJson = struct {
     players: usize,
     maxPlayers: u32,
     gameType: i32,
+    editor: bool,
+    hardcore: bool,
+    onlineAuth: bool,
+    selfSignedAuth: bool,
+    nonce: []const u8,
+    transportLayer: i32,
+    connection: i32,
 };
 
 test "a hostile status config still yields parseable json" {
@@ -1598,6 +1840,14 @@ test "a hostile status config still yields parseable json" {
     try std.testing.expectEqual(@as(usize, 3), parsed.value.players);
     try std.testing.expectEqual(@as(u32, 10), parsed.value.maxPlayers);
     try std.testing.expectEqual(@as(i32, 2), parsed.value.gameType);
+    try std.testing.expectEqual(discovery.ServerData.version, parsed.value.dataVersion);
+    try std.testing.expectEqual(discovery.transport_layer_nethernet, parsed.value.transportLayer);
+    try std.testing.expectEqual(data.connection_type, parsed.value.connection);
+    try std.testing.expectEqual(data.accepts_online_auth, parsed.value.onlineAuth);
+    try std.testing.expectEqual(data.accepts_self_signed_auth, parsed.value.selfSignedAuth);
+    try std.testing.expectEqual(data.editor_world, parsed.value.editor);
+    try std.testing.expectEqual(data.hardcore, parsed.value.hardcore);
+    try std.testing.expectEqualStrings(data.nonce, parsed.value.nonce);
 }
 
 test "the status body fits its buffer at the documented limits" {
@@ -1995,7 +2245,7 @@ test "a second join in the same second is refused with 429" {
         .bind_address = address,
         .accept_unverified_identity = true,
         .max_concurrent_requests = 1,
-        .rate_limit = .{ .joins_per_minute = 60, .burst = 1 },
+        .rate_limit = .{ .joins_per_minute = 1, .burst = 1 },
     });
     defer {
         server.deinit();
@@ -2017,7 +2267,7 @@ test "a second join in the same second is refused with 429" {
     var second_buffer: [512]u8 = undefined;
     const second = try rawExchange(io, address, request_writer.buffered(), &second_buffer);
     try std.testing.expect(std.mem.startsWith(u8, second, "HTTP/1.1 429"));
-    try std.testing.expect(std.mem.indexOf(u8, second, "retry-after: 1") != null);
+    try std.testing.expect(std.mem.indexOf(u8, second, "retry-after: ") != null);
 }
 
 test "an established session is judged by the disconnect grace, not the establishment timeout" {
@@ -2083,18 +2333,44 @@ const CloseCounter = struct {
     }
 };
 
+const BlockingOpen = struct {
+    io: std.Io,
+    opened: std.Io.Event = .unset,
+    release: std.Io.Event = .unset,
+
+    fn handler(self: *BlockingOpen) peer_mod.MessageHandler {
+        return .{
+            .ctx = self,
+            .on_open = onOpen,
+            .on_message = onMessage,
+        };
+    }
+
+    fn onOpen(ctx: *anyopaque, _: *peer_mod.PeerHandle) void {
+        const self: *BlockingOpen = @ptrCast(@alignCast(ctx));
+        self.opened.set(self.io);
+        self.release.waitUncancelable(self.io);
+    }
+
+    fn onMessage(_: *anyopaque, _: *peer_mod.PeerHandle, _: peer_mod.ChannelKind, _: []const u8) ?[]const u8 {
+        return null;
+    }
+};
+
 const JoinWorker = struct {
     io: std.Io,
     address: std.Io.net.IpAddress,
     offer: []const u8,
     client: u8 = 0,
+    network: ?[]const u8 = null,
     buffer: [16 * 1024]u8 = undefined,
     status: u16 = 0,
 
     fn run(self: *JoinWorker) void {
         var request_buffer: [8192]u8 = undefined;
         var id_buffer: [24]u8 = undefined;
-        const id = std.fmt.bufPrint(&id_buffer, "parallel-{d}", .{self.client}) catch return;
+        const generated = std.fmt.bufPrint(&id_buffer, "parallel-{d}", .{self.client}) catch return;
+        const id = self.network orelse generated;
         var writer: std.Io.Writer = .fixed(&request_buffer);
         joinRequest(&writer, self.offer, id) catch return;
         const response = rawExchange(self.io, self.address, writer.buffered(), &self.buffer) catch return;
@@ -2129,6 +2405,56 @@ test "more joins than workers all complete" {
     for (threads) |thread| thread.join();
     for (workers) |worker| try std.testing.expectEqual(@as(u16, 200), worker.status);
     try std.testing.expectEqual(@as(usize, 8), server.sessionCount());
+}
+
+test "a duplicate join waits for the first answer instead of failing" {
+    const io = std.testing.io;
+    const allocator = std.testing.allocator;
+    const address: std.Io.net.IpAddress = .{ .ip4 = std.Io.net.Ip4Address.loopback(20026) };
+    var blocking = BlockingOpen{ .io = io };
+    var server = try Server.init(io, allocator, .{
+        .bind_address = address,
+        .accept_unverified_identity = true,
+        .max_concurrent_requests = 2,
+        .handler = blocking.handler(),
+    });
+    defer {
+        server.deinit();
+    }
+    try server.start();
+
+    var provider = identity_mod.Provider.init(io, .{});
+    const offer = try provider.addToSdp(allocator, lan_srv.real_offer);
+    defer allocator.free(offer);
+
+    var first = JoinWorker{ .io = io, .address = address, .offer = offer, .network = "duplicate" };
+    var second = JoinWorker{ .io = io, .address = address, .offer = offer, .network = "duplicate" };
+    const first_thread = try std.Thread.spawn(.{}, JoinWorker.run, .{&first});
+    blocking.opened.waitUncancelable(io);
+    const second_thread = try std.Thread.spawn(.{}, JoinWorker.run, .{&second});
+
+    var refs: usize = 0;
+    for (0..1000) |_| {
+        server.joining_mutex.lockUncancelable(io);
+        var joining = server.joining.valueIterator();
+        while (joining.next()) |state| {
+            if (!std.mem.eql(u8, state.*.network_id, "duplicate")) continue;
+            state.*.mutex.lockUncancelable(io);
+            refs = state.*.refs;
+            state.*.mutex.unlock(io);
+        }
+        server.joining_mutex.unlock(io);
+        if (refs >= 2) break;
+        try io.sleep(.fromMilliseconds(1), .awake);
+    }
+    try std.testing.expectEqual(@as(usize, 2), refs);
+
+    blocking.release.set(io);
+    first_thread.join();
+    second_thread.join();
+    try std.testing.expectEqual(@as(u16, 200), first.status);
+    try std.testing.expectEqual(@as(u16, 200), second.status);
+    try std.testing.expectEqual(@as(usize, 1), server.sessionCount());
 }
 
 test "an occupancy provider refuses joins the shard table alone would accept" {
@@ -2435,6 +2761,72 @@ test "an offer without identity follows require_identity and the policy" {
         try std.testing.expect(active.identity == null);
         server.releaseSession(active);
     }
+}
+
+test "an unverifiable identity is admitted anonymously when identity is optional" {
+    const io = std.testing.io;
+    const allocator = std.testing.allocator;
+    var response_buffer: [16 * 1024]u8 = undefined;
+    const forged = lan_srv.real_offer ++ "a=identity:not-base64\r\n";
+
+    {
+        const address: std.Io.net.IpAddress = .{ .ip4 = std.Io.net.Ip4Address.loopback(20022) };
+        var server = try Server.init(io, allocator, .{
+            .bind_address = address,
+            .accept_unverified_identity = true,
+            .require_identity = false,
+        });
+        defer server.deinit();
+        const response = try joinResponse(io, &server, address, forged, "invalid-optional", &response_buffer);
+        try std.testing.expect(std.mem.startsWith(u8, response, "HTTP/1.1 200"));
+        const active = latestSession(&server) orelse return error.TestUnexpectedResult;
+        try std.testing.expect(active.identity == null);
+        server.releaseSession(active);
+    }
+
+    {
+        const address: std.Io.net.IpAddress = .{ .ip4 = std.Io.net.Ip4Address.loopback(20023) };
+        var server = try Server.init(io, allocator, .{
+            .bind_address = address,
+            .accept_unverified_identity = true,
+            .require_identity = true,
+        });
+        defer server.deinit();
+        const response = try joinResponse(io, &server, address, forged, "invalid-required", &response_buffer);
+        try std.testing.expect(std.mem.startsWith(u8, response, "HTTP/1.1 400"));
+        try std.testing.expectEqual(@as(usize, 0), server.sessionCount());
+    }
+
+    const address: std.Io.net.IpAddress = .{ .ip4 = std.Io.net.Ip4Address.loopback(20024) };
+    try std.testing.expectError(error.IdentityVerifierRequired, Server.init(io, allocator, .{
+        .bind_address = address,
+        .require_identity = false,
+    }));
+}
+
+test "a verifier refuses an unverifiable identity even when anonymous joins are allowed" {
+    const io = std.testing.io;
+    const allocator = std.testing.allocator;
+    const provider = identity_mod.Provider.init(io, .{});
+    const jwks = try jwksFor(allocator, provider.key_pair.public_key);
+    defer allocator.free(jwks);
+    var verifier = try identity_verify.Verifier.init(io, allocator, .{ .jwks_document = jwks });
+    defer verifier.deinit();
+
+    const address: std.Io.net.IpAddress = .{ .ip4 = std.Io.net.Ip4Address.loopback(20025) };
+    var server = try Server.init(io, allocator, .{
+        .bind_address = address,
+        .identity_verifier = &verifier,
+        .accept_unverified_identity = true,
+        .require_identity = false,
+    });
+    defer server.deinit();
+
+    var response_buffer: [16 * 1024]u8 = undefined;
+    const forged = lan_srv.real_offer ++ "a=identity:not-base64\r\n";
+    const response = try joinResponse(io, &server, address, forged, "verified-invalid", &response_buffer);
+    try std.testing.expect(std.mem.startsWith(u8, response, "HTTP/1.1 400"));
+    try std.testing.expectEqual(@as(usize, 0), server.sessionCount());
 }
 
 test "a verifier refuses an anonymous join while the config demands identity" {

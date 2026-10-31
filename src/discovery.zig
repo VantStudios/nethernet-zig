@@ -90,6 +90,9 @@ pub const GameType = enum(i32) { survival = 0, creative = 1, adventure = 2 };
 
 pub const advertised_build = .{ .protocol = 4422, .game_version = "1.26.60" };
 
+/// `transportLayer` in the status JSON: the NetherNet transport.
+pub const transport_layer_nethernet: i32 = 2;
+
 pub const ServerData = struct {
     server_name: []const u8,
     protocol: i32 = advertised_build.protocol,

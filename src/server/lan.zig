@@ -70,6 +70,7 @@ pub const Config = struct {
     identity: ?identity_mod.Provider = null,
     identity_verifier: ?*identity_verify.Verifier = null,
     identity_policy: ?identity_verify.IdentityPolicy = null,
+    accept_unverified_identity: bool = false,
     require_identity: bool = false,
     ice_servers: []const peer_mod.IceServer = &.{},
     public_candidate: ?sdp_edit.PublicCandidate = null,
@@ -241,16 +242,17 @@ pub const Server = struct {
             .broadcast = true,
         }) catch |err| {
             self.bind_failures += 1;
+            if (err == error.AddressInUse and self.config.max_bind_attempts != 0) {
+                self.bind_failures = self.config.max_bind_attempts;
+                std.log.warn(
+                    "LAN discovery disabled: UDP {d} is already in use, usually by the Minecraft client on this machine. The LAN list will not show this " ++
+                        "server; joins by IP go through HTTP signaling and are unaffected.",
+                    .{self.config.port},
+                );
+                return;
+            }
             if (self.bind_failures == 1) {
                 std.log.warn("LAN discovery cannot bind UDP 0.0.0.0:{d}: {s}", .{ self.config.port, @errorName(err) });
-                if (err == error.AddressInUse) {
-                    std.log.warn(
-                        "UDP {d} is held by another socket, usually the Minecraft client running on this machine, which does not share it: this process asked for a " ++
-                            "shareable port (SO_REUSEADDR and SO_REUSEPORT where the OS has them) and the bind was refused anyway. The LAN list will not show " ++
-                            "this server; joins by IP go through the HTTP path and are unaffected. Retrying every {d} ms, {d} attempts in all.",
-                        .{ self.config.port, self.config.bind_retry_ms, self.config.max_bind_attempts },
-                    );
-                }
             } else if (self.isDisabled()) {
                 std.log.warn(
                     "LAN discovery gave up on UDP {d} after {d} attempts: {s}. Signaling and the external server list responder keep running, the LAN list stays " ++
@@ -474,6 +476,7 @@ pub const Server = struct {
         const identity = validateOffer(self.allocator, network_text, signal.data, .{
             .verifier = self.config.identity_verifier,
             .policy = self.config.identity_policy,
+            .accept_unverified_identity = self.config.accept_unverified_identity,
             .require_identity = self.config.require_identity,
         }) catch |err| {
             const code: discovery.ErrorCode = switch (err) {
@@ -917,8 +920,23 @@ fn writeCandidateAttributes(writer: *std.Io.Writer, candidate: []const u8, ufrag
 pub const OfferCheck = struct {
     verifier: ?*identity_verify.Verifier = null,
     policy: ?identity_verify.IdentityPolicy = null,
+    accept_unverified_identity: bool = false,
     require_identity: bool = false,
 };
+
+fn admitAnonymous(check: OfferCheck, network_id: []const u8) Error!?identity_verify.SessionIdentity {
+    if (check.policy) |admission| {
+        if (!admission.allow(admission.ctx, network_id, null)) return error.IdentityRejected;
+    }
+    if (check.require_identity) return error.MissingIdentity;
+    return null;
+}
+
+fn anonymousOrError(check: OfferCheck, network_id: []const u8, err: Error) Error!?identity_verify.SessionIdentity {
+    if (!check.accept_unverified_identity or check.require_identity) return err;
+    std.log.warn("LAN peer identity could not be verified; admitting an anonymous join ({s})", .{@errorName(err)});
+    return admitAnonymous(check, network_id);
+}
 
 fn validateOffer(allocator: std.mem.Allocator, network_id: []const u8, offer: []const u8, check: OfferCheck) Error!?identity_verify.SessionIdentity {
     if (!std.mem.startsWith(u8, offer, "v=")) return error.InvalidSdp;
@@ -946,18 +964,25 @@ fn validateOffer(allocator: std.mem.Allocator, network_id: []const u8, offer: []
 
     var envelope = sdp_identity.extract(offer, allocator, .{}) catch |err| switch (err) {
         error.MissingIdentity => if (check.require_identity) return error.MissingIdentity else return null,
+        error.InvalidIdentity => return anonymousOrError(check, network_id, err),
         else => return err,
     };
     defer sdp_identity.deinit(allocator, &envelope);
     const Assertion = struct { fingerprints: []const u8, token: []const u8 };
-    const parsed = std.json.parseFromSlice(Assertion, allocator, envelope.assertion, .{ .ignore_unknown_fields = true }) catch return error.InvalidIdentity;
+    const parsed = std.json.parseFromSlice(Assertion, allocator, envelope.assertion, .{ .ignore_unknown_fields = true }) catch
+        return anonymousOrError(check, network_id, error.InvalidIdentity);
     defer parsed.deinit();
     if (std.mem.count(u8, parsed.value.token, ".") != 2 or
-        std.mem.count(u8, parsed.value.fingerprints, ".") != 2) return error.InvalidIdentity;
+        std.mem.count(u8, parsed.value.fingerprints, ".") != 2)
+        return anonymousOrError(check, network_id, error.InvalidIdentity);
 
     var identity = identity_verify.verifyAssertion(allocator, envelope.assertion, offer) catch |err| {
-        std.log.warn("LAN peer identity did not verify: {s}", .{@errorName(err)});
-        return error.InvalidIdentity;
+        if (!check.accept_unverified_identity or check.require_identity) {
+            std.log.warn("LAN peer identity did not verify: {s}", .{@errorName(err)});
+            return error.InvalidIdentity;
+        }
+        std.log.warn("LAN peer identity could not be verified; admitting an anonymous join ({s})", .{@errorName(err)});
+        return admitAnonymous(check, network_id);
     };
     defer identity.deinit(allocator);
     if (check.policy) |admission| {
@@ -1075,6 +1100,27 @@ test "LAN offer validation admits an unsigned offer but never a forged one" {
     const forged = unsigned ++ "a=identity:not-base64\r\n";
     try std.testing.expectError(error.InvalidIdentity, validateOffer(allocator, "lan", forged, .{}));
     try std.testing.expectError(error.InvalidIdentity, validateOffer(allocator, "lan", forged, .{ .require_identity = true }));
+    try std.testing.expectEqual(
+        @as(?identity_verify.SessionIdentity, null),
+        try validateOffer(allocator, "lan", forged, .{ .accept_unverified_identity = true }),
+    );
+    try std.testing.expectError(
+        error.InvalidIdentity,
+        validateOffer(allocator, "lan", forged, .{ .accept_unverified_identity = true, .require_identity = true }),
+    );
+
+    var probe: PolicyProbe = .{ .allow = false };
+    try std.testing.expectError(
+        error.IdentityRejected,
+        validateOffer(allocator, "lan", forged, .{ .accept_unverified_identity = true, .policy = probe.policy() }),
+    );
+    try std.testing.expectEqual(@as(usize, 1), probe.seen);
+    probe.allow = true;
+    try std.testing.expectEqual(
+        @as(?identity_verify.SessionIdentity, null),
+        try validateOffer(allocator, "lan", forged, .{ .accept_unverified_identity = true, .policy = probe.policy() }),
+    );
+    try std.testing.expectEqual(@as(usize, 2), probe.seen);
 }
 
 fn jwksFor(allocator: std.mem.Allocator, public_key: std.crypto.sign.ecdsa.EcdsaP384Sha384.PublicKey) ![]u8 {
@@ -1207,6 +1253,11 @@ test "LAN checks a present claim against the verifier and the policy" {
     _ = try validateOffer(allocator, "lan", signed, .{ .verifier = &verifier, .policy = probe.policy() });
     try std.testing.expect(probe.seen_claims);
 
+    try std.testing.expectError(
+        error.InvalidIdentity,
+        validateOffer(allocator, "lan", unsigned ++ "a=identity:not-base64\r\n", .{ .verifier = &verifier, .accept_unverified_identity = true }),
+    );
+
     const changed = try allocator.dupe(u8, signed);
     defer allocator.free(changed);
     const start = std.mem.indexOf(u8, changed, "a=fingerprint:") orelse return error.TestUnexpectedResult;
@@ -1255,7 +1306,7 @@ test "an offer description names the attributes and only the identity shape" {
     try std.testing.expectEqualStrings(expected_jws, describeOffer(&buffer, bare_jws));
 }
 
-test "LAN discovery keeps serving 19132 when the discovery port is taken" {
+test "LAN discovery disables itself when the discovery port is taken" {
     const io = std.testing.io;
     const port: u16 = 19935;
     var occupier = udp.Socket.open(io, .{
@@ -1274,9 +1325,7 @@ test "LAN discovery keeps serving 19132 when the discovery port is taken" {
     var server = try Server.init(io, std.testing.allocator, .{ .port = port });
     defer server.deinit();
     // Windows shares a port its `SO_REUSEADDR` asked for even when the holder did
-    // not ask, so the discovery socket joins the occupier instead of being refused
-    // and there is no retry loop to observe; elsewhere the bind fails until the
-    // port is free.
+    // not ask, so the discovery socket joins the occupier instead of being refused.
     if (comptime builtin.os.tag == .windows) {
         try std.testing.expect(server.isBound());
         server.tick();
@@ -1284,17 +1333,23 @@ test "LAN discovery keeps serving 19132 when the discovery port is taken" {
     } else {
         try std.testing.expect(!server.isBound());
         server.tick();
-        try std.testing.expect(!server.isBound());
+        try std.testing.expect(server.isDisabled());
+        try std.testing.expectEqual(server.config.max_bind_attempts, server.bind_failures);
     }
 
     occupier.close();
     occupied = false;
     server.next_bind_attempt_ms = 0;
     server.tick();
-    try std.testing.expect(server.isBound());
+    if (comptime builtin.os.tag == .windows) {
+        try std.testing.expect(server.isBound());
+    } else {
+        try std.testing.expect(!server.isBound());
+        try std.testing.expect(server.isDisabled());
+    }
 }
 
-test "LAN discovery gives up after its attempt limit and does not come back" {
+test "LAN discovery does not retry after a port conflict" {
     const io = std.testing.io;
     const port: u16 = 19954;
     var occupier = udp.Socket.open(io, .{
@@ -1322,14 +1377,11 @@ test "LAN discovery gives up after its attempt limit and does not come back" {
         try std.testing.expect(!server.isDisabled());
     } else {
         try std.testing.expect(!server.isBound());
-        try std.testing.expect(!server.isDisabled());
-        server.next_bind_attempt_ms = 0;
-        server.tick();
-        try std.testing.expect(!server.isDisabled());
+        try std.testing.expect(server.isDisabled());
+        try std.testing.expectEqual(@as(usize, 3), server.bind_failures);
         server.next_bind_attempt_ms = 0;
         server.tick();
         try std.testing.expect(server.isDisabled());
-        try std.testing.expectEqual(@as(usize, 3), server.bind_failures);
     }
 
     occupier.close();

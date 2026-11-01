@@ -7,8 +7,6 @@ const dispatch = @import("dispatch.zig");
 const ratelimit = @import("ratelimit.zig");
 const framing = @import("../transport/framing.zig");
 const sdp_edit = @import("../transport/sdp_edit.zig");
-const wire_log = @import("wire_log.zig");
-const log = @import("../log.zig");
 const peer_mod = @import("../webrtc/peer.zig");
 const identity_mod = @import("../identity/server.zig");
 const identity_verify = @import("../identity/verify.zig");
@@ -259,8 +257,6 @@ pub const Server = struct {
                         "empty, and LAN discovery starts trying again only in a new process.",
                     .{ self.config.port, self.bind_failures, @errorName(err) },
                 );
-            } else {
-                log.debug("LAN discovery bind retry failed: {s}", .{@errorName(err)});
             }
             self.next_bind_attempt_ms = self.nowMs() + self.config.bind_retry_ms;
             return;
@@ -415,27 +411,16 @@ pub const Server = struct {
                 std.log.warn("LAN discovery receive failed: {s}", .{@errorName(err)});
                 return;
             } orelse return;
-            self.handleDatagram(self.recv_buffer[0..datagram.len], datagram.from) catch |e| {
-                log.debug("LAN discovery datagram ignored: {s}", .{@errorName(e)});
-            };
+            self.handleDatagram(self.recv_buffer[0..datagram.len], datagram.from) catch {};
         }
     }
 
     fn handleDatagram(self: *Server, frame: []const u8, source: udp.Address) Error!void {
         const packet = try discovery.decodePacketInto(self.decode_buffer, frame);
-        if (packet.recovered_bytes != 0) {
-            log.debug(
-                "LAN discovery recovered {d} bytes past an underdeclared signal length sender={d}",
-                .{ packet.recovered_bytes, packet.sender_id },
-            );
-        }
         if (packet.sender_id == self.config.network_id) return;
         switch (packet.kind) {
             .request => {
-                if (!self.discovery_replies.allow(source.addr)) {
-                    log.debug("LAN discovery request dropped: source over its reply budget", .{});
-                    return;
-                }
+                if (!self.discovery_replies.allow(source.addr)) return;
                 try self.sendResponse(source);
             },
             .message => {
@@ -620,7 +605,6 @@ pub const Server = struct {
         connection.handle.peer = &connection.peer;
         pending_identity = null;
         session_ready = true;
-        log.debug("LAN offer sender={d} negotiated maxMessageSize={d}", .{ sender_id, max_message_size });
         if (sdp_identity.iceUfrag(stripped)) |ufrag| {
             const length = @min(ufrag.len, connection.ufrag.len);
             @memcpy(connection.ufrag[0..length], ufrag[0..length]);
@@ -640,25 +624,15 @@ pub const Server = struct {
 
     fn handleCandidate(self: *Server, sender_id: u64, signal: discovery.SignalRef, source: udp.Address) void {
         const connection = self.findConnection(sender_id, signal.connection_id) orelse return;
-        if (!ownsSource(connection, source)) {
-            log.debug("LAN signaling dropped a candidate from another source sender={d}", .{sender_id});
-            return;
-        }
+        if (!ownsSource(connection, source)) return;
         if (connection.established) return;
-        connection.peer.addRemoteCandidate(signal.data) catch |err| {
-            log.debug("LAN signaling ignored candidate sender={d}: {s}", .{ sender_id, @errorName(err) });
-            return;
-        };
+        connection.peer.addRemoteCandidate(signal.data) catch return;
         connection.last_activity_ms = self.nowMs();
-        log.debug("LAN candidate added sender={d} connection={s}", .{ sender_id, signal.connection_id });
     }
 
     fn handlePeerError(self: *Server, sender_id: u64, signal: discovery.SignalRef, source: udp.Address) void {
         const connection = self.findConnection(sender_id, signal.connection_id) orelse return;
-        if (!ownsSource(connection, source)) {
-            log.debug("LAN signaling dropped a CONNECTERROR from another source sender={d}", .{sender_id});
-            return;
-        }
+        if (!ownsSource(connection, source)) return;
         std.log.info("LAN peer reported error sender={d} code={s}", .{ sender_id, signal.data });
         self.failConnection(connection, .generic_failure);
     }
@@ -674,9 +648,7 @@ pub const Server = struct {
             if (connection.failure == null and !connection.terminate and connection.peer.stateOf() != .closed) continue;
             if (connection.failure) |code| {
                 if (!connection.established) {
-                    self.sendErrorCode(connection.sender_id, connection.connection_id, code, connection.address) catch |err| {
-                        log.debug("LAN CONNECTERROR not delivered sender={d}: {s}", .{ connection.sender_id, @errorName(err) });
-                    };
+                    self.sendErrorCode(connection.sender_id, connection.connection_id, code, connection.address) catch {};
                 }
             }
             std.log.info("LAN connection released session id={d} sender={d} connection={s}", .{ connection.handle.id, connection.sender_id, connection.connection_id });
@@ -699,13 +671,6 @@ pub const Server = struct {
         };
         while (connection.peer.pollEvent()) |event| switch (event) {
             .binary => |message| {
-                var hex_buffer: wire_log.HexBuffer = undefined;
-                log.debug("LAN session sender={d} received {d} bytes reliability={s} hex={s}", .{
-                    connection.sender_id,
-                    message.data.len,
-                    @tagName(message.kind),
-                    wire_log.hex(&hex_buffer, message.data),
-                });
                 connection.last_activity_ms = now;
                 const channel: framing.Channel = switch (message.kind) {
                     .reliable => .reliable,
@@ -720,9 +685,9 @@ pub const Server = struct {
                     .{ connection.sender_id, @errorName(err) },
                 );
             },
-            .state_changed => |state| log.debug("LAN session sender={d} state={s}", .{ connection.sender_id, @tagName(state) }),
-            .channel_opened => |kind| log.debug("LAN session sender={d} channel opened={s}", .{ connection.sender_id, @tagName(kind) }),
-            .channel_closed => |kind| log.debug("LAN session sender={d} channel closed={s}", .{ connection.sender_id, @tagName(kind) }),
+            .state_changed => {},
+            .channel_opened => {},
+            .channel_closed => {},
             .channel_attached => {},
             .failed => |err| self.failConnection(connection, failureFor(err)),
         };
@@ -751,8 +716,7 @@ pub const Server = struct {
 
         var candidate_buffer: [candidate_buffer_size]u8 = undefined;
         while (true) {
-            const candidate = connection.peer.pollLocalCandidate(&candidate_buffer) catch |err| {
-                log.debug("LAN candidate drain stopped sender={d}: {s}", .{ connection.sender_id, @errorName(err) });
+            const candidate = connection.peer.pollLocalCandidate(&candidate_buffer) catch {
                 break;
             } orelse break;
             try self.sendLocalCandidate(connection, candidate);
@@ -793,7 +757,6 @@ pub const Server = struct {
         try writeCandidateAttributes(&writer, candidate, connection.ufragSlice(), connection.candidate_index);
         connection.candidate_index += 1;
         try self.sendSignal(connection.sender_id, .candidate_add, connection.connection_id, writer.buffered(), connection.address);
-        log.debug("LAN CANDIDATEADD sent sender={d} index={d}", .{ connection.sender_id, connection.candidate_index - 1 });
     }
 
     fn sendSignal(
@@ -824,7 +787,6 @@ pub const Server = struct {
     ) Error!void {
         var buffer: [16]u8 = undefined;
         const text = std.fmt.bufPrint(&buffer, "{d}", .{@intFromEnum(code)}) catch return error.InvalidArgument;
-        log.debug("LAN CONNECTERROR sender={d} code={d}", .{ sender_id, @intFromEnum(code) });
         try self.sendSignal(sender_id, .connect_error, connection_id, text, address);
     }
 
@@ -836,18 +798,6 @@ pub const Server = struct {
         try server_data.write(&writer);
         const frame = try discovery.encodeResponseInPlace(self.frame_buffer, self.config.network_id, writer.buffered());
         try self.sendFrame(frame, destination);
-        const address = std.mem.bigToNative(u32, destination.addr);
-        log.debug(
-            "LAN discovery response sent bytes={d} to {d}.{d}.{d}.{d}:{d}",
-            .{
-                frame.len,
-                (address >> 24) & 0xff,
-                (address >> 16) & 0xff,
-                (address >> 8) & 0xff,
-                address & 0xff,
-                std.mem.bigToNative(u16, destination.port),
-            },
-        );
     }
 
     fn sendFrame(self: *Server, frame: []const u8, destination: udp.Address) Error!void {

@@ -1,8 +1,6 @@
 const std = @import("std");
 const builtin = @import("builtin");
 
-const log = @import("../log.zig");
-
 const Io = std.Io;
 const linux = std.os.linux;
 const ws2_32 = std.os.windows.ws2_32;
@@ -115,8 +113,7 @@ pub const Socket = struct {
 
     fn setLinuxOption(fd: i32, name: u32) void {
         var value: i32 = 1;
-        const rc = linux.setsockopt(fd, linux.SOL.SOCKET, name, @ptrCast(&value), @sizeOf(i32));
-        if (linux.errno(rc) != .SUCCESS) log.debug("UDP socket option {d} refused by the kernel", .{name});
+        _ = linux.setsockopt(fd, linux.SOL.SOCKET, name, @ptrCast(&value), @sizeOf(i32));
     }
 
     fn openLibc(io: Io, options: Options) OpenError!Socket {
@@ -145,9 +142,7 @@ pub const Socket = struct {
 
     fn setLibcOption(fd: std.c.fd_t, name: u32) void {
         var value: c_int = 1;
-        if (std.c.setsockopt(fd, std.c.SOL.SOCKET, name, &value, @sizeOf(c_int)) != 0) {
-            log.debug("UDP socket option {d} refused: {s}", .{ name, @tagName(std.posix.errno(@as(c_int, -1))) });
-        }
+        _ = std.c.setsockopt(fd, std.c.SOL.SOCKET, name, &value, @sizeOf(c_int));
     }
 
     fn openWinsock(io: Io, options: Options) OpenError!Socket {
@@ -326,9 +321,7 @@ const Winsock = struct {
 
     fn setOption(s: SOCKET, name: c_int) void {
         var value: c_int = 1;
-        if (setsockopt(s, ws2_32.SOL.SOCKET, name, &value, @sizeOf(c_int)) != 0) {
-            log.debug("UDP socket option {d} refused by Winsock", .{name});
-        }
+        _ = setsockopt(s, ws2_32.SOL.SOCKET, name, &value, @sizeOf(c_int));
     }
 
     fn lastError() c_int {

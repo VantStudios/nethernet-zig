@@ -2,7 +2,6 @@ const std = @import("std");
 const builtin = @import("builtin");
 const udp = @import("../platform/udp.zig");
 const discovery = @import("../discovery.zig");
-const log = @import("../log.zig");
 const policy = @import("policy.zig");
 const ratelimit = @import("ratelimit.zig");
 
@@ -90,8 +89,6 @@ pub const Server = struct {
                         .{ self.config.port, self.config.bind_retry_ms },
                     );
                 }
-            } else {
-                log.debug("external server ping bind retry failed: {s}", .{@errorName(err)});
             }
             self.bind_failures += 1;
             self.next_bind_attempt_ms = self.nowMs() + self.config.bind_retry_ms;
@@ -144,33 +141,14 @@ pub const Server = struct {
 
     fn answer(self: *Server, source: udp.Address, frame: []const u8) void {
         if (frame.len == 0) return;
-        if (!self.replies.allow(source.addr)) {
-            log.debug("external server ping dropped: source over its reply budget", .{});
-            return;
-        }
+        if (!self.replies.allow(source.addr)) return;
         var pong_buffer: [pong_payload_size]u8 = undefined;
-        const pong = buildPong(self.config, frame, &pong_buffer) orelse {
-            log.debug("external server ping ignored id=0x{x:0>2} bytes={d}", .{ frame[0], frame.len });
-            return;
-        };
+        const pong = buildPong(self.config, frame, &pong_buffer) orelse return;
         self.sendFrame(pong, source) catch |err| {
             std.log.warn("external server ping reply failed: {s}", .{@errorName(err)});
             return;
         };
         self.answered += 1;
-        const address = std.mem.bigToNative(u32, source.addr);
-        log.debug(
-            "external server ping answered from {d}.{d}.{d}.{d}:{d} bytes={d} total={d}",
-            .{
-                (address >> 24) & 0xff,
-                (address >> 16) & 0xff,
-                (address >> 8) & 0xff,
-                address & 0xff,
-                std.mem.bigToNative(u16, source.port),
-                pong.len,
-                self.answered,
-            },
-        );
     }
 
     fn sendFrame(self: *Server, frame: []const u8, destination: udp.Address) Error!void {

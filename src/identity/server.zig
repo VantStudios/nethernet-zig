@@ -1,7 +1,5 @@
 const std = @import("std");
 
-const log = @import("../log.zig");
-
 const identity_sdp = @import("sdp.zig");
 
 const Scheme = std.crypto.sign.ecdsa.EcdsaP384Sha384;
@@ -129,14 +127,6 @@ pub const Provider = struct {
 
         var cpk_buffer: [cpk_claim_max_length]u8 = undefined;
         const public_key_cpk = self.cpkClaim(&cpk_buffer);
-        const cpk_digest = sha256(public_key_cpk);
-        const cpk_hex = std.fmt.bytesToHex(cpk_digest, .lower);
-        log.debug("server identity: cpk encoding={s} claim={d} bytes sha-256={s}", .{
-            @tagName(self.cpk_encoding),
-            public_key_cpk.len,
-            cpk_hex[0..],
-        });
-
         const claims_json = try std.fmt.allocPrint(allocator, "{{\"exp\":{d},\"iat\":{d},\"cpk\":{s}}}", .{ now + self.lifetime_seconds, now, public_key_cpk });
         defer allocator.free(claims_json);
 

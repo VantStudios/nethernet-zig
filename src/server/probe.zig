@@ -7,7 +7,6 @@ const peer_mod = @import("../webrtc/peer.zig");
 const identity_mod = @import("../identity/server.zig");
 const sdp_identity = @import("../identity/sdp.zig");
 const identity_verify = @import("../identity/verify.zig");
-const log = @import("../log.zig");
 const lan = @import("lan.zig");
 
 pub const client_network_id: u64 = 0x0bad_f00d_cafe_babe;
@@ -168,12 +167,6 @@ pub fn run(io: std.Io, allocator: std.mem.Allocator, options: Options) Error!Rep
                     report.response_bytes = packet.data.len;
                 },
                 .message => {
-                    if (packet.recovered_bytes != 0) {
-                        log.debug(
-                            "probe recovered {d} bytes past an underdeclared signal length",
-                            .{packet.recovered_bytes},
-                        );
-                    }
                     if (packet.recipient_id != client_network_id) continue;
                     var signal = discovery.Signal.parse(allocator, packet.data) catch continue;
                     defer signal.deinit(allocator);

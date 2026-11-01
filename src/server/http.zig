@@ -4,8 +4,6 @@ const policy = @import("policy.zig");
 const dispatch = @import("dispatch.zig");
 const framing = @import("../transport/framing.zig");
 const sdp_edit = @import("../transport/sdp_edit.zig");
-const wire_log = @import("wire_log.zig");
-const log = @import("../log.zig");
 const peer_mod = @import("../webrtc/peer.zig");
 const identity_mod = @import("../identity/server.zig");
 const sdp_identity = @import("../identity/sdp.zig");
@@ -491,13 +489,6 @@ pub const Server = struct {
             var released = false;
             while (active.peer.pollEvent()) |event| switch (event) {
                 .binary => |message| {
-                    var hex_buffer: wire_log.HexBuffer = undefined;
-                    log.debug("session id={d} networkId={s} wire bytes={d} hex={s}", .{
-                        active.handle.id,
-                        log_id,
-                        message.data.len,
-                        wire_log.hex(&hex_buffer, message.data),
-                    });
                     const channel: framing.Channel = switch (message.kind) {
                         .reliable => .reliable,
                         .unreliable => .unreliable,
@@ -511,9 +502,9 @@ pub const Server = struct {
                         .{ active.handle.id, log_id, @errorName(err) },
                     );
                 },
-                .state_changed => |state| log.debug("session id={d} networkId={s} state={s}", .{ active.handle.id, log_id, @tagName(state) }),
-                .channel_opened => |kind| log.debug("session id={d} networkId={s} channel opened={s}", .{ active.handle.id, log_id, @tagName(kind) }),
-                .channel_closed => |kind| log.debug("session id={d} networkId={s} channel closed={s}", .{ active.handle.id, log_id, @tagName(kind) }),
+                .state_changed => {},
+                .channel_opened => {},
+                .channel_closed => {},
                 .failed => |err| {
                     std.log.err("session id={d} networkId={s} peer failure={s}", .{ active.handle.id, log_id, @errorName(err) });
                     self.releaseShardSlot(slot, active);
@@ -779,7 +770,6 @@ pub const Server = struct {
         var stream = try self.listener.accept(self.io);
         defer stream.close(self.io);
         if (self.stopping.load(.acquire)) return;
-        log.debug("accepted HTTP signaling connection", .{});
 
         var timed_out: std.atomic.Value(bool) = .init(false);
         if (self.config.request_timeout_ms <= 0) return self.serveStream(stream, input, &timed_out);
@@ -830,9 +820,6 @@ pub const Server = struct {
                 return err;
             };
             std.log.info("HTTP request at ms={d}: {s} {s}", .{ wallClockMs(self.io), @tagName(request.head.method), request.head.target });
-            var headers = request.iterateHeaders();
-            while (headers.next()) |header| log.debug("HTTP header: {s}: {s}", .{ header.name, header.value });
-
             const path = pathOnly(request.head.target);
             if ((request.head.method == .GET or request.head.method == .HEAD) and
                 (std.mem.eql(u8, path, "/v1/join") or std.mem.eql(u8, path, "/v1/join/")))
@@ -929,7 +916,6 @@ pub const Server = struct {
             },
         };
         const response_body = writer.buffered();
-        log.debug("responding status bytes={d} body={s}", .{ response_body.len, response_body });
         try request.respond(response_body, .{
             .status = .ok,
             .keep_alive = keep_alive,
@@ -983,7 +969,6 @@ pub const Server = struct {
             sdp_identity.maxMessageSize(clean_offer),
             self.config.max_message_size,
         );
-        log.debug("SDP offer networkId={s} negotiated maxMessageSize={d}", .{ log_id, max_message_size });
 
         const claim = self.beginJoin(network_id, clean_offer) catch |err| {
             std.log.err("could not reserve networkId={s}: {s}", .{ log_id, @errorName(err) });
@@ -1147,8 +1132,6 @@ pub const Server = struct {
             if (!admission.allow(admission.ctx, network_id, &verified.claims)) return error.IdentityRejected;
         }
         const identity = try verified.sessionIdentity(self.allocator);
-        const key_hex = std.fmt.bytesToHex(identity.key_sha256, .lower);
-        log.debug("peer identity verified cpk form={s} key sha-256={s}", .{ @tagName(identity.form), key_hex[0..] });
         return identity;
     }
 
@@ -1174,7 +1157,6 @@ pub const Server = struct {
             if (!admission.allow(admission.ctx, network_id, null)) return error.IdentityRejected;
         }
         if (self.config.require_identity) return error.MissingIdentity;
-        log.debug("admitting anonymous join networkId={s}: require_identity=false", .{network_id});
         return null;
     }
 
@@ -1370,14 +1352,7 @@ fn sniffFirstChunk(io: std.Io, reader: *std.Io.Reader, writer: *std.Io.Writer) !
             writer.flush() catch {};
             return false;
         },
-        .http => {
-            var preview_buffer: [128]u8 = undefined;
-            log.debug(
-                "signaling peer first chunk bytes={d} preview=\"{s}\"",
-                .{ received.len, previewText(&preview_buffer, received) },
-            );
-            return true;
-        },
+        .http => return true,
     }
 }
 
@@ -1755,7 +1730,7 @@ test "signaling preview escapes non printable bytes and bounds output" {
 }
 
 fn serveOnceForTest(server: *Server) void {
-    server.serveOne() catch |err| log.debug("test signaling transaction ended: {s}", .{@errorName(err)});
+    server.serveOne() catch {};
 }
 
 fn sendAndServe(

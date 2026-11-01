@@ -8,7 +8,6 @@ const peer_mod = @import("../webrtc/peer.zig");
 const identity_mod = @import("../identity/server.zig");
 const identity_verify = @import("../identity/verify.zig");
 const udp = @import("../platform/udp.zig");
-const log = @import("../log.zig");
 const policy = @import("policy.zig");
 const http_srv = @import("http.zig");
 const lan_srv = @import("lan.zig");
@@ -629,8 +628,7 @@ test "a host serves the paths it is told to serve" {
 }
 
 fn serveOneForTest(host: *Host) void {
-    if (host.http) |*server| server.serveOne() catch |err|
-        log.debug("test signaling transaction ended: {s}", .{@errorName(err)});
+    if (host.http) |*server| server.serveOne() catch {};
 }
 
 fn sendSignaling(

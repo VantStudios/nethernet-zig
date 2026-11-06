@@ -577,7 +577,7 @@ test "the host refuses an identity domain or lifetime it cannot sign" {
         .{ .domain = "partner.example." },
         .{ .domain = "partner\"example" },
         .{ .domain = "-partner.example" },
-        .{ .domain = ("a" ** 64) ++ ".example" },
+        .{ .domain = (@as([64]u8, @splat('a'))) ++ ".example" },
         .{ .lifetime = 59 },
         .{ .lifetime = 604_801 },
     };

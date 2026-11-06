@@ -786,7 +786,7 @@ pub const Server = struct {
         address: udp.Address,
     ) Error!void {
         var buffer: [16]u8 = undefined;
-        const text = std.fmt.bufPrint(&buffer, "{d}", .{@intFromEnum(code)}) catch return error.InvalidArgument;
+        const text = std.fmt.bufPrint(&buffer, "{d}", .{@backingInt(code)}) catch return error.InvalidArgument;
         try self.sendSignal(sender_id, .connect_error, connection_id, text, address);
     }
 
@@ -1079,8 +1079,7 @@ fn jwksFor(allocator: std.mem.Allocator, public_key: std.crypto.sign.ecdsa.Ecdsa
     var y_buffer: [std.base64.url_safe_no_pad.Encoder.calcSize(48)]u8 = undefined;
     const x = std.base64.url_safe_no_pad.Encoder.encode(&x_buffer, point[1..49]);
     const y = std.base64.url_safe_no_pad.Encoder.encode(&y_buffer, point[49..97]);
-    return std.fmt.allocPrint(
-        allocator,
+    return allocator.print(
         "{{\"keys\":[{{\"kty\":\"EC\",\"crv\":\"P-384\",\"kid\":\"test\",\"x\":\"{s}\",\"y\":\"{s}\"}}]}}",
         .{ x, y },
     );
@@ -1122,7 +1121,7 @@ fn offerWithForeignDetached(allocator: std.mem.Allocator, sdp: []const u8, owner
     const other_assertion = try std.json.parseFromSlice(Assertion, allocator, other_envelope.assertion, .{ .ignore_unknown_fields = true });
     defer other_assertion.deinit();
 
-    const assertion = try std.fmt.allocPrint(allocator, "{{\"fingerprints\":\"{s}\",\"token\":\"{s}\"}}", .{ other_assertion.value.fingerprints, owner_assertion.value.token });
+    const assertion = try allocator.print("{{\"fingerprints\":\"{s}\",\"token\":\"{s}\"}}", .{ other_assertion.value.fingerprints, owner_assertion.value.token });
     defer allocator.free(assertion);
     var envelope: std.Io.Writer.Allocating = .init(allocator);
     defer envelope.deinit();
@@ -1134,7 +1133,7 @@ fn offerWithForeignDetached(allocator: std.mem.Allocator, sdp: []const u8, owner
     defer allocator.free(encoded);
     _ = std.base64.standard.Encoder.encode(encoded, envelope.written());
     const insert_at = try sdp_identity.sessionInsertOffset(sdp);
-    return std.fmt.allocPrint(allocator, "{s}a=identity:{s}\r\n{s}", .{ sdp[0..insert_at], encoded, sdp[insert_at..] });
+    return allocator.print("{s}a=identity:{s}\r\n{s}", .{ sdp[0..insert_at], encoded, sdp[insert_at..] });
 }
 
 test "LAN verifies a present claim without a verifier" {
@@ -1219,8 +1218,7 @@ test "LAN checks a present claim against the verifier and the policy" {
 test "an offer description names the attributes and only the identity shape" {
     var buffer: [1024]u8 = undefined;
     const unsigned = "v=0\r\na=ice-ufrag:abcd\r\na=fingerprint:sha-256 AA:BB\r\nm=application 9 UDP/DTLS/SCTP webrtc-datachannel\r\n";
-    const expected_unsigned = try std.fmt.allocPrint(
-        std.testing.allocator,
+    const expected_unsigned = try std.testing.allocator.print(
         "bytes={d} attributes=[v=0 a=ice-ufrag a=fingerprint m=application] identity=absent",
         .{unsigned.len},
     );
@@ -1229,8 +1227,7 @@ test "an offer description names the attributes and only the identity shape" {
 
     const envelope = "eyJpZHAiOnsiZG9tYWluIjoieCIsInByb3RvY29sIjoiZGVmYXVsdCJ9LCJhc3NlcnRpb24iOiJ0b2tlbiJ9";
     const signed = unsigned ++ "a=identity:" ++ envelope ++ "\r\n";
-    const expected_signed = try std.fmt.allocPrint(
-        std.testing.allocator,
+    const expected_signed = try std.testing.allocator.print(
         "bytes={d} attributes=[v=0 a=ice-ufrag a=fingerprint m=application a=identity] identity bytes={d} dots=0 base64-json=true",
         .{ signed.len, envelope.len },
     );
@@ -1238,8 +1235,7 @@ test "an offer description names the attributes and only the identity shape" {
     try std.testing.expectEqualStrings(expected_signed, describeOffer(&buffer, signed));
 
     const long_signed = unsigned ++ "a=identity:" ++ envelope ++ envelope ++ "\r\n";
-    const expected_long = try std.fmt.allocPrint(
-        std.testing.allocator,
+    const expected_long = try std.testing.allocator.print(
         "bytes={d} attributes=[v=0 a=ice-ufrag a=fingerprint m=application a=identity] identity bytes={d} dots=0 base64-json=true",
         .{ long_signed.len, envelope.len * 2 },
     );
@@ -1247,8 +1243,7 @@ test "an offer description names the attributes and only the identity shape" {
     try std.testing.expectEqualStrings(expected_long, describeOffer(&buffer, long_signed));
 
     const bare_jws = "v=0\r\na=identity:ey.ey.sig\r\n";
-    const expected_jws = try std.fmt.allocPrint(
-        std.testing.allocator,
+    const expected_jws = try std.testing.allocator.print(
         "bytes={d} attributes=[v=0 a=identity] identity bytes=9 dots=2 base64-json=false",
         .{bare_jws.len},
     );

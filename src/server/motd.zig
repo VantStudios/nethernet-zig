@@ -204,7 +204,7 @@ fn buildPong(config: Config, frame: []const u8, buffer: []u8) ?[]const u8 {
         config.server_guid,
         data.level_name,
         gameModeName(data.game_type),
-        @intFromEnum(data.game_type),
+        @backingInt(data.game_type),
         config.port,
         config.port,
     }) catch return null;

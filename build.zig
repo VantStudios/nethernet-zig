@@ -8,7 +8,7 @@ pub fn build(b: *std.Build) void {
 
     // HOTFIX: Explicitly pass `--gc-sections` in Debug mode to strip GCC 16's
     // unsupported `.sframe` relocations in `crt1.o` (already done in Release).
-    const debug_gc_sections: ?bool = if (optimize == .Debug) true else null;
+    const debug_gc_sections: ?bool = if (optimize == .debug) true else null;
 
     const webrtc_dependency = b.dependency("webrtc", .{
         .target = target,
@@ -51,7 +51,7 @@ pub fn build(b: *std.Build) void {
     const test_step = b.step("test", "Run library and example tests");
     test_step.dependOn(&run_library_tests.step);
 
-    const serialize_test_runs = builtin.os.tag == .windows;
+    const serialize_test_runs = builtin.target.os.tag == .windows;
     var last_test_run: *std.Build.Step = &run_library_tests.step;
 
     const check_step = b.step("check", "Compile the library and every test artifact for the selected target");
@@ -94,7 +94,7 @@ pub fn build(b: *std.Build) void {
             b.fmt("Build and run the {s} example", .{example.name}),
         );
         const example_run = b.addRunArtifact(example_exe);
-        if (b.args) |args| example_run.addArgs(args);
+        example_run.addPassthruArgs();
         example_run_step.dependOn(&example_run.step);
 
         if (std.mem.eql(u8, example.name, "cli")) {

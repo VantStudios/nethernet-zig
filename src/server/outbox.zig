@@ -421,7 +421,7 @@ test "concurrent producers lose nothing and the consumer sees every message" {
         thread.* = try std.Thread.spawn(.{}, Worker.run, .{ &outbox, @as(u8, @intCast(index + 1)) });
     }
 
-    var counts = [_]usize{0} ** producers;
+    var counts: [producers]usize = @splat(0);
     var drained: usize = 0;
     const total = producers * per_producer;
     while (drained < total) {

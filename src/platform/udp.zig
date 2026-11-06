@@ -221,11 +221,11 @@ pub const Socket = struct {
     pub fn receive(self: *const Socket, buffer: []u8) ReceiveError!?Datagram {
         switch (comptime flavor) {
             .linux => {
-                var source: linux.sockaddr = undefined;
-                var source_len: linux.socklen_t = @sizeOf(linux.sockaddr);
-                const raw = linux.recvfrom(self.handle, buffer.ptr, buffer.len, 0, &source, &source_len);
+                var source: Address = undefined;
+                var source_len: linux.socklen_t = @sizeOf(Address);
+                const raw = linux.recvfrom(self.handle, buffer.ptr, buffer.len, 0, @ptrCast(&source), &source_len);
                 return switch (linux.errno(raw)) {
-                    .SUCCESS => .{ .len = @intCast(raw), .from = @bitCast(source) },
+                    .SUCCESS => .{ .len = @intCast(raw), .from = source },
                     .AGAIN, .CONNRESET => null,
                     else => error.ReceiveFailed,
                 };

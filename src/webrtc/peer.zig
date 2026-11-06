@@ -784,8 +784,8 @@ pub const NativePeerConnection = struct {
             for (self.socket_addrs[0..self.socket_count]) |local| {
                 if (std.meta.activeTag(local) != std.meta.activeTag(remote)) continue;
                 switch (parsed.scheme) {
-                    .stun => self.connection.addStunServer(local, remote) catch {},
-                    .turn => self.connection.addTurnServer(local, remote, server.username, server.credential) catch {},
+                    .stun => self.connection.addIceServer(local, .{ .stun = remote }, nowMs(self.io)) catch {},
+                    .turn => self.connection.addIceServer(local, .{ .turn = .{ .address = remote, .username = server.username, .password = server.credential } }, nowMs(self.io)) catch {},
                     else => {},
                 }
             }
@@ -958,16 +958,12 @@ pub const NativePeerConnection = struct {
 
     fn drainAppData(self: *NativePeerConnection, iterator: *native.PeerConnection.SctpMessageIterator) PeerError!void {
         while (iterator.next() catch return error.OutOfMemory) |message| {
-            const data = @constCast(message.data);
             if (self.channelById(message.channel_id) == null) {
                 self.attachRemoteChannel(message.channel_id) catch {};
             }
 
-            const channel = self.channelById(message.channel_id) orelse {
-                if (data.len != 0) self.allocator.free(data);
-                continue;
-            };
-            channel.pushOwned(data, message.binary);
+            const channel = self.channelById(message.channel_id) orelse continue;
+            try channel.pushCopy(message.data, message.binary);
         }
     }
 
@@ -1251,23 +1247,19 @@ pub const NativeDataChannel = struct {
         });
     }
 
-    /// Takes ownership of `bytes`, which the SCTP layer allocated with this peer's
-    /// allocator: a message that fits the pool is copied and released, and one that
-    /// does not moves into the ring without a copy.
-    pub fn pushOwned(self: *NativeDataChannel, bytes: []u8, binary: bool) void {
+    /// Copies `bytes`, which the SCTP layer owns until its next read, into the pool
+    /// or a heap payload owned by this channel.
+    pub fn pushCopy(self: *NativeDataChannel, bytes: []const u8, binary: bool) std.mem.Allocator.Error!void {
         if (!binary) {
-            self.freeOwned(bytes);
             self.push(.{ .failed = error.UnsupportedChannel });
             return;
         }
         if (bytes.len > max_payload) {
-            self.freeOwned(bytes);
             self.push(.{ .failed = error.Backpressure });
             return;
         }
         if (self.count == self.queue.len) {
             self.overflowed = true;
-            self.freeOwned(bytes);
             return;
         }
 
@@ -1275,21 +1267,14 @@ pub const NativeDataChannel = struct {
             const offset = self.pool_used;
             @memcpy(self.pool[offset..][0..bytes.len], bytes);
             self.pool_used += bytes.len;
-            self.freeOwned(bytes);
             break :blk .{ .binary = .{ .pooled = .{
                 .offset = @intCast(offset),
                 .len = @intCast(bytes.len),
             } } };
         } else blk: {
-            break :blk .{ .binary = .{ .heap = bytes } };
+            break :blk .{ .binary = .{ .heap = try self.allocator.dupe(u8, bytes) } };
         };
         self.push(queued);
-    }
-
-    /// Zero-length messages come from the SCTP layer as a static slice, so only a
-    /// real allocation is handed back.
-    fn freeOwned(self: *NativeDataChannel, bytes: []u8) void {
-        if (bytes.len != 0) self.allocator.free(bytes);
     }
 
     fn push(self: *NativeDataChannel, event: NativeEvent) void {
@@ -1530,13 +1515,7 @@ test "native receive preserves heartbeat acknowledgements across queued datagram
         try io.sleep(.fromMilliseconds(1), .awake);
     }
 
-    const Crc32c = std.hash.crc.Crc(u32, .{
-        .polynomial = 0x1edc6f41,
-        .initial = 0xffffffff,
-        .reflect_input = true,
-        .reflect_output = true,
-        .xor_output = 0xffffffff,
-    });
+    const Crc32c = std.hash.crc.@"CRC-32/ISCSI";
     var packet: [28]u8 = @splat(0);
     const assoc = &answer_backend.connection.sctp_transport.assoc;
     std.mem.writeInt(u16, packet[0..2], assoc.dest_port, .big);
@@ -1552,8 +1531,8 @@ test "native receive preserves heartbeat acknowledgements across queued datagram
         @memcpy(packet[20..28], token);
         @memset(packet[8..12], 0);
         std.mem.writeInt(u32, packet[8..12], Crc32c.hash(&packet), .little);
-        const encrypted = offer_backend.connection.dtls_transport.handleWrite(&packet, &wire);
-        try offer_backend.sockets[0].send(io, &answer_backend.socket_addrs[0], encrypted);
+        const message = try offer_backend.connection.dtls_transport.writeAppData(&packet, &wire);
+        try offer_backend.sockets[0].send(io, &answer_backend.socket_addrs[0], message.data);
     }
 
     var acknowledged: usize = 0;
@@ -1790,9 +1769,9 @@ test "the event arena grows on demand and reclaims drained payloads" {
 
     try std.testing.expectEqual(@as(usize, 64), peer.event_arena_capacity);
 
-    const first = [_]u8{'a'} ** 64;
-    const second = [_]u8{'b'} ** 64;
-    const third = [_]u8{'c'} ** 64;
+    const first: [64]u8 = @splat('a');
+    const second: [64]u8 = @splat('b');
+    const third: [64]u8 = @splat('c');
 
     reliable.push(.{ .binary = &first });
     try peer.tick();
@@ -1828,8 +1807,8 @@ test "binary payloads are bounded by the event budget and a full arena drops ins
     defer peer.deinit(allocator);
     try peer.attachChannel(.reliable, reliable.channel());
 
-    const first = [_]u8{'a'} ** 48;
-    const second = [_]u8{'b'} ** 48;
+    const first: [48]u8 = @splat('a');
+    const second: [48]u8 = @splat('b');
     reliable.push(.{ .binary = &first });
     try peer.tick();
     reliable.push(.{ .binary = &second });
@@ -1837,7 +1816,7 @@ test "binary payloads are bounded by the event budget and a full arena drops ins
 
     reliable.push(.{ .binary = &first });
     try peer.tick();
-    const too_big = [_]u8{'c'} ** 49;
+    const too_big: [49]u8 = @splat('c');
     reliable.push(.{ .binary = &too_big });
     try peer.tick();
     try std.testing.expectEqual(PeerState.new, peer.stateOf());
@@ -1860,8 +1839,8 @@ test "small inbound messages stage in the channel pool without allocating" {
     var storage: NativeDataChannel = undefined;
     storage = .{ .allocator = allocator, .channel = undefined, .kind = .reliable };
 
-    storage.pushOwned(try allocator.dupe(u8, "eight byte"), true);
-    storage.pushOwned(try allocator.dupe(u8, "second"), true);
+    try storage.pushCopy("eight byte", true);
+    try storage.pushCopy("second", true);
 
     const first = (try storage.wrapper().poll()).?.binary;
     try std.testing.expectEqualStrings("eight byte", first);
@@ -1882,8 +1861,9 @@ test "a message past the channel pool falls back to the heap and is released" {
     storage = .{ .allocator = allocator, .channel = undefined, .kind = .reliable };
 
     const big = try allocator.alloc(u8, NativeDataChannel.pool_bytes + 1);
+    defer allocator.free(big);
     @memset(big, 0x7a);
-    storage.pushOwned(big, true);
+    try storage.pushCopy(big, true);
 
     const message = (try storage.wrapper().poll()).?.binary;
     try std.testing.expectEqual(big.len, message.len);
@@ -1900,9 +1880,9 @@ test "a full ring of small messages stays inside the channel pool" {
     storage = .{ .allocator = allocator, .channel = undefined, .kind = .reliable };
 
     for (0..63) |index| {
-        const message = try allocator.alloc(u8, 60);
-        @memset(message, @intCast(index));
-        storage.pushOwned(message, true);
+        var message: [60]u8 = undefined;
+        @memset(&message, @intCast(index));
+        try storage.pushCopy(&message, true);
     }
 
     var count: usize = 0;

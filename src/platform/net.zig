@@ -50,7 +50,7 @@ test "peer keys keep IPv4 whole and truncate IPv6 to its prefix" {
     const key4 = mapAddress(&storage) orelse return error.TestUnexpectedResult;
     try std.testing.expectEqual(@as(u8, 4), key4[0]);
     try std.testing.expectEqualSlices(u8, &.{ 127, 0, 0, 1 }, key4[1..5]);
-    try std.testing.expectEqualSlices(u8, &([_]u8{0} ** 11), key4[5..16]);
+    try std.testing.expectEqualSlices(u8, &@as([11]u8, @splat(0)), key4[5..16]);
 
     var storage6: std.posix.sockaddr.storage = std.mem.zeroes(std.posix.sockaddr.storage);
     const v6: *std.posix.sockaddr.in6 = @ptrCast(&storage6);
@@ -59,5 +59,5 @@ test "peer keys keep IPv4 whole and truncate IPv6 to its prefix" {
     const key6 = mapAddress(&storage6) orelse return error.TestUnexpectedResult;
     try std.testing.expectEqual(@as(u8, 6), key6[0]);
     try std.testing.expectEqualSlices(u8, v6.addr[0..8], key6[1..9]);
-    try std.testing.expectEqualSlices(u8, &([_]u8{0} ** 7), key6[9..16]);
+    try std.testing.expectEqualSlices(u8, &@as([7]u8, @splat(0)), key6[9..16]);
 }

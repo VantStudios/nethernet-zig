@@ -232,7 +232,7 @@ fn testStorePath(buffer: []u8) ![]const u8 {
 }
 
 fn testDigest(seed: u8) [digest_length]u8 {
-    return [_]u8{seed} ** digest_length;
+    return @splat(seed);
 }
 
 test "a pin survives a save and a reload" {

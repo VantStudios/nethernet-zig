@@ -127,12 +127,12 @@ pub const Provider = struct {
 
         var cpk_buffer: [cpk_claim_max_length]u8 = undefined;
         const public_key_cpk = self.cpkClaim(&cpk_buffer);
-        const claims_json = try std.fmt.allocPrint(allocator, "{{\"exp\":{d},\"iat\":{d},\"cpk\":{s}}}", .{ now + self.lifetime_seconds, now, public_key_cpk });
+        const claims_json = try allocator.print("{{\"exp\":{d},\"iat\":{d},\"cpk\":{s}}}", .{ now + self.lifetime_seconds, now, public_key_cpk });
         defer allocator.free(claims_json);
 
         const claims_b64 = try encodeUrl(allocator, claims_json);
         defer allocator.free(claims_b64);
-        const signing_input = try std.fmt.allocPrint(allocator, "{s}.{s}", .{ protected_header, claims_b64 });
+        const signing_input = try allocator.print("{s}.{s}", .{ protected_header, claims_b64 });
         defer allocator.free(signing_input);
         const token = try compactSignature(allocator, self.key_pair, signing_input, protected_header, claims_b64);
         defer allocator.free(token);
@@ -141,20 +141,20 @@ pub const Provider = struct {
         defer allocator.free(fingerprint_payload);
         const payload_b64 = try encodeUrl(allocator, fingerprint_payload);
         defer allocator.free(payload_b64);
-        const detached_input = try std.fmt.allocPrint(allocator, "{s}.{s}", .{ protected_header, payload_b64 });
+        const detached_input = try allocator.print("{s}.{s}", .{ protected_header, payload_b64 });
         defer allocator.free(detached_input);
         const detached_signature = try signatureB64(allocator, self.key_pair, detached_input);
         defer allocator.free(detached_signature);
-        const fingerprints = try std.fmt.allocPrint(allocator, "{s}..{s}", .{ protected_header, detached_signature });
+        const fingerprints = try allocator.print("{s}..{s}", .{ protected_header, detached_signature });
         defer allocator.free(fingerprints);
 
-        const inner = try std.fmt.allocPrint(allocator, "{{\"fingerprints\":\"{s}\",\"token\":\"{s}\"}}", .{ fingerprints, token });
+        const inner = try allocator.print("{{\"fingerprints\":\"{s}\",\"token\":\"{s}\"}}", .{ fingerprints, token });
         defer allocator.free(inner);
         const escaped_inner = try escapeJson(allocator, inner);
         defer allocator.free(escaped_inner);
         const escaped_domain = try escapeJson(allocator, self.domain);
         defer allocator.free(escaped_domain);
-        const envelope = try std.fmt.allocPrint(allocator, "{{\"assertion\":\"{s}\",\"idp\":{{\"domain\":\"{s}\",\"protocol\":\"default\"}}}}", .{ escaped_inner, escaped_domain });
+        const envelope = try allocator.print("{{\"assertion\":\"{s}\",\"idp\":{{\"domain\":\"{s}\",\"protocol\":\"default\"}}}}", .{ escaped_inner, escaped_domain });
         defer allocator.free(envelope);
 
         const encoded_len = std.base64.standard.Encoder.calcSize(envelope.len);
@@ -164,7 +164,7 @@ pub const Provider = struct {
         _ = std.base64.standard.Encoder.encode(encoded, envelope);
 
         const insert_at = try identity_sdp.sessionInsertOffset(sdp);
-        return std.fmt.allocPrint(allocator, "{s}a=identity:{s}\r\n{s}", .{ sdp[0..insert_at], encoded, sdp[insert_at..] });
+        return allocator.print("{s}a=identity:{s}\r\n{s}", .{ sdp[0..insert_at], encoded, sdp[insert_at..] });
     }
 
     fn cpkClaim(self: *const Provider, buffer: []u8) []const u8 {
@@ -270,7 +270,7 @@ fn signatureB64(allocator: std.mem.Allocator, key_pair: Scheme.KeyPair, input: [
 fn compactSignature(allocator: std.mem.Allocator, key_pair: Scheme.KeyPair, input: []const u8, header: []const u8, claims: []const u8) ![]u8 {
     const signature = try signatureB64(allocator, key_pair, input);
     defer allocator.free(signature);
-    return std.fmt.allocPrint(allocator, "{s}.{s}.{s}", .{ header, claims, signature });
+    return allocator.print("{s}.{s}.{s}", .{ header, claims, signature });
 }
 
 test "server identity emits Zig-compatible envelope" {
@@ -400,7 +400,7 @@ test "a key file that is not a scalar is refused and left untouched" {
 fn deterministicProvider(encoding: Provider.CpkEncoding, seed: u8) !Provider {
     return .{
         .io = std.testing.io,
-        .key_pair = try Scheme.KeyPair.generateDeterministic([_]u8{seed} ** Scheme.KeyPair.seed_length),
+        .key_pair = try Scheme.KeyPair.generateDeterministic(@splat(seed)),
         .cpk_encoding = encoding,
     };
 }
@@ -458,8 +458,7 @@ test "the jwk claim is the RFC 7518 object of the signing key, byte for byte" {
     var y_buffer: [std.base64.url_safe_no_pad.Encoder.calcSize(48)]u8 = undefined;
     const x = std.base64.url_safe_no_pad.Encoder.encode(&x_buffer, point[1..49]);
     const y = std.base64.url_safe_no_pad.Encoder.encode(&y_buffer, point[49..97]);
-    const expected = try std.fmt.allocPrint(
-        std.testing.allocator,
+    const expected = try std.testing.allocator.print(
         "{{\"crv\":\"P-384\",\"kty\":\"EC\",\"x\":\"{s}\",\"y\":\"{s}\"}}",
         .{ x, y },
     );
@@ -530,7 +529,7 @@ test "both cpk encodings name the key that signed the JWT" {
 
         const point = try pointFromClaim(claim, encoding);
         const public_key = try Scheme.PublicKey.fromSec1(&point);
-        const signing_input = try std.fmt.allocPrint(std.testing.allocator, "{s}.{s}", .{ header_b64, claims_b64 });
+        const signing_input = try std.testing.allocator.print("{s}.{s}", .{ header_b64, claims_b64 });
         defer std.testing.allocator.free(signing_input);
         var signature_bytes: [Scheme.Signature.encoded_length]u8 = undefined;
         try std.base64.url_safe_no_pad.Decoder.decode(&signature_bytes, signature_b64);
@@ -547,7 +546,7 @@ test "both cpk encodings name the key that signed the JWT" {
 test "a coordinate with a zero top byte keeps its 48 bytes in both claims" {
     var attempt: u16 = 0;
     while (attempt < 4096) : (attempt += 1) {
-        var seed = [_]u8{0x5a} ** Scheme.KeyPair.seed_length;
+        var seed: [Scheme.KeyPair.seed_length]u8 = @splat(0x5a);
         std.mem.writeInt(u16, seed[0..2], attempt, .little);
         const key_pair = try Scheme.KeyPair.generateDeterministic(seed);
         const point = key_pair.public_key.toUncompressedSec1();
@@ -599,8 +598,8 @@ test "the identity config rejects domains and lifetimes that cannot travel" {
         "partner.example.",
         "-partner.example",
         "partner-.example",
-        ("a" ** 64) ++ ".example",
-        ("a" ** 50) ++ "." ++ ("a" ** 50) ++ "." ++ ("a" ** 50) ++ "." ++ ("a" ** 50) ++ "." ++ ("a" ** 50),
+        (@as([64]u8, @splat('a'))) ++ ".example",
+        (@as([50]u8, @splat('a'))) ++ "." ++ (@as([50]u8, @splat('a'))) ++ "." ++ (@as([50]u8, @splat('a'))) ++ "." ++ (@as([50]u8, @splat('a'))) ++ "." ++ (@as([50]u8, @splat('a'))),
         "partnér.example",
         "_partner.example",
     };

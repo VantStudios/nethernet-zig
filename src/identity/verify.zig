@@ -342,7 +342,7 @@ pub fn verifyToken(io: std.Io, allocator: std.mem.Allocator, token: []const u8, 
     errdefer allocator.free(claims_json);
     var claims = try parseClaims(allocator, claims_json);
     defer claims.deinit();
-    const signing_input = try std.fmt.allocPrint(allocator, "{s}.{s}", .{ segments.header, segments.claims });
+    const signing_input = try allocator.print("{s}.{s}", .{ segments.header, segments.claims });
     defer allocator.free(signing_input);
     try verifyEcdsa(claims.cpk.public_key, signing_input, segments.signature, error.BadTokenSignature);
     const now = options.now_seconds orelse std.Io.Clock.real.now(io).toSeconds();
@@ -426,7 +426,7 @@ pub fn verifyFingerprints(allocator: std.mem.Allocator, public_key: Scheme.Publi
     defer allocator.free(payload_json);
     const payload_b64 = try encodeUrl(allocator, payload_json);
     defer allocator.free(payload_b64);
-    const signing_input = try std.fmt.allocPrint(allocator, "{s}.{s}", .{ header, payload_b64 });
+    const signing_input = try allocator.print("{s}.{s}", .{ header, payload_b64 });
     defer allocator.free(signing_input);
     try verifyEcdsa(public_key, signing_input, signature, error.BadFingerprintSignature);
 }
@@ -458,9 +458,9 @@ fn verifyPkcs1(key: TokenKey.RsaKey, signing_input: []const u8, signature_text: 
     try decodeEither(raw[0..length], signature_text, failure);
     const Hash = std.crypto.hash.sha2.Sha256;
     const result = switch (length) {
-        256 => rsa.PKCS1v1_5Signature.verify(256, raw[0..256].*, signing_input, key.public_key, Hash),
-        384 => rsa.PKCS1v1_5Signature.verify(384, raw[0..384].*, signing_input, key.public_key, Hash),
-        512 => rsa.PKCS1v1_5Signature.verify(512, raw[0..512].*, signing_input, key.public_key, Hash),
+        256 => rsa.PKCS1v1_5Signature.verify(256, &raw[0..256].*, signing_input, key.public_key, Hash),
+        384 => rsa.PKCS1v1_5Signature.verify(384, &raw[0..384].*, signing_input, key.public_key, Hash),
+        512 => rsa.PKCS1v1_5Signature.verify(512, &raw[0..512].*, signing_input, key.public_key, Hash),
         else => return failure,
     };
     result catch return failure;
@@ -552,7 +552,7 @@ pub const JwksClient = struct {
             .redirect_behavior = .not_allowed,
             .response_writer = &body.writer,
         }) catch return error.JwksUnavailable;
-        if (@intFromEnum(result.status) != 200) return error.JwksUnavailable;
+        if (@backingInt(result.status) != 200) return error.JwksUnavailable;
         const document = body.written();
         if (document.len == 0 or document.len > 1024 * 1024) return error.JwksUnavailable;
         try self.load(document);
@@ -646,7 +646,7 @@ pub const Verifier = struct {
         const algorithm = algorithmForName(header.value.alg) orelse return error.UnsupportedAlgorithm;
 
         const signing_key = try self.jwks.keyFor(self.io, &self.jwks_lock, header.value.kid);
-        const signing_input = try std.fmt.allocPrint(self.allocator, "{s}.{s}", .{ segments.header, segments.claims });
+        const signing_input = try self.allocator.print("{s}.{s}", .{ segments.header, segments.claims });
         defer self.allocator.free(signing_input);
         try verifyTokenSignature(signing_key, algorithm, signing_input, segments.signature, error.BadTokenSignature);
 
@@ -873,7 +873,7 @@ const two_line_sdp = "v=0\r\na=fingerprint:sha-256 AA:BB:CC:DD\r\na=fingerprint:
 const issuer_kid = "auth-1";
 
 fn testKey(seed: u8) !Scheme.KeyPair {
-    return Scheme.KeyPair.generateDeterministic([_]u8{seed} ** Scheme.KeyPair.seed_length);
+    return Scheme.KeyPair.generateDeterministic(@splat(seed));
 }
 
 fn encode(comptime capacity: usize, buffer: *[capacity]u8, value: []const u8) []const u8 {
@@ -894,7 +894,7 @@ fn jwkClaim(allocator: std.mem.Allocator, public_key: Scheme.PublicKey) ![]u8 {
     var y_buffer: [std.base64.url_safe_no_pad.Encoder.calcSize(48)]u8 = undefined;
     const x = std.base64.url_safe_no_pad.Encoder.encode(&x_buffer, point[1..49]);
     const y = std.base64.url_safe_no_pad.Encoder.encode(&y_buffer, point[49..97]);
-    return std.fmt.allocPrint(allocator, "{{\"crv\":\"P-384\",\"kty\":\"EC\",\"x\":\"{s}\",\"y\":\"{s}\"}}", .{ x, y });
+    return allocator.print("{{\"crv\":\"P-384\",\"kty\":\"EC\",\"x\":\"{s}\",\"y\":\"{s}\"}}", .{ x, y });
 }
 
 fn claimText(allocator: std.mem.Allocator, public_key: Scheme.PublicKey, form: Form) ![]u8 {
@@ -904,7 +904,7 @@ fn claimText(allocator: std.mem.Allocator, public_key: Scheme.PublicKey, form: F
             const der = spkiDer(public_key);
             var encoded_buffer: [std.base64.standard.Encoder.calcSize(spki_length)]u8 = undefined;
             const encoded = std.base64.standard.Encoder.encode(&encoded_buffer, &der);
-            return std.fmt.allocPrint(allocator, "\"{s}\"", .{encoded});
+            return allocator.print("\"{s}\"", .{encoded});
         },
     }
 }
@@ -915,8 +915,7 @@ fn jwksDocument(allocator: std.mem.Allocator, public_key: Scheme.PublicKey, kid:
     var y_buffer: [std.base64.url_safe_no_pad.Encoder.calcSize(48)]u8 = undefined;
     const x = std.base64.url_safe_no_pad.Encoder.encode(&x_buffer, point[1..49]);
     const y = std.base64.url_safe_no_pad.Encoder.encode(&y_buffer, point[49..97]);
-    return std.fmt.allocPrint(
-        allocator,
+    return allocator.print(
         "{{\"keys\":[{{\"kty\":\"EC\",\"crv\":\"P-384\",\"kid\":\"{s}\",\"x\":\"{s}\",\"y\":\"{s}\"}}]}}",
         .{ kid, x, y },
     );
@@ -936,8 +935,7 @@ fn jsonEscape(allocator: std.mem.Allocator, value: []const u8) ![]u8 {
 fn embedAssertion(allocator: std.mem.Allocator, sdp: []const u8, assertion_json: []const u8) ![]u8 {
     const escaped = try jsonEscape(allocator, assertion_json);
     defer allocator.free(escaped);
-    const envelope = try std.fmt.allocPrint(
-        allocator,
+    const envelope = try allocator.print(
         "{{\"assertion\":\"{s}\",\"idp\":{{\"domain\":\"self\",\"protocol\":\"default\"}}}}",
         .{escaped},
     );
@@ -947,7 +945,7 @@ fn embedAssertion(allocator: std.mem.Allocator, sdp: []const u8, assertion_json:
     _ = std.base64.standard.Encoder.encode(encoded, envelope);
 
     const media = std.mem.indexOf(u8, sdp, "m=") orelse return error.TestUnexpectedResult;
-    return std.fmt.allocPrint(allocator, "{s}a=identity:{s}\r\n{s}", .{ sdp[0..media], encoded, sdp[media..] });
+    return allocator.print("{s}a=identity:{s}\r\n{s}", .{ sdp[0..media], encoded, sdp[media..] });
 }
 
 const OfferOptions = struct {
@@ -968,19 +966,17 @@ fn clientOffer(allocator: std.mem.Allocator, issuer: Scheme.KeyPair, peer: Schem
     defer allocator.free(claim);
 
     const header_json = if (options.kid) |kid|
-        try std.fmt.allocPrint(allocator, "{{\"alg\":\"{s}\",\"kid\":\"{s}\"}}", .{ options.alg, kid })
+        try allocator.print("{{\"alg\":\"{s}\",\"kid\":\"{s}\"}}", .{ options.alg, kid })
     else
-        try std.fmt.allocPrint(allocator, "{{\"alg\":\"{s}\"}}", .{options.alg});
+        try allocator.print("{{\"alg\":\"{s}\"}}", .{options.alg});
     defer allocator.free(header_json);
     const claims_json = if (options.exp_offset) |offset|
-        try std.fmt.allocPrint(
-            allocator,
+        try allocator.print(
             "{{\"cpk\":{s},\"exp\":{d},\"iat\":{d},\"xuid\":\"2535400000000001\",\"uuid\":\"069a79f4-44e9-4726-a5be-fca90e38aaf5\",\"permissions\":\"player\"}}",
             .{ claim, now + offset, now + options.iat_offset },
         )
     else
-        try std.fmt.allocPrint(
-            allocator,
+        try allocator.print(
             "{{\"cpk\":{s},\"iat\":{d},\"xuid\":\"2535400000000001\",\"uuid\":\"069a79f4-44e9-4726-a5be-fca90e38aaf5\",\"permissions\":\"player\"}}",
             .{ claim, now + options.iat_offset },
         );
@@ -990,11 +986,11 @@ fn clientOffer(allocator: std.mem.Allocator, issuer: Scheme.KeyPair, peer: Schem
     const header_segment = encode(header_buffer.len, &header_buffer, header_json);
     var claims_buffer: [1024]u8 = undefined;
     const claims_segment = encode(claims_buffer.len, &claims_buffer, claims_json);
-    const signing_input = try std.fmt.allocPrint(allocator, "{s}.{s}", .{ header_segment, claims_segment });
+    const signing_input = try allocator.print("{s}.{s}", .{ header_segment, claims_segment });
     defer allocator.free(signing_input);
     const token_signature = try signatureText(allocator, options.token_signer orelse issuer, signing_input);
     defer allocator.free(token_signature);
-    const token = try std.fmt.allocPrint(allocator, "{s}.{s}.{s}", .{ header_segment, claims_segment, token_signature });
+    const token = try allocator.print("{s}.{s}.{s}", .{ header_segment, claims_segment, token_signature });
     defer allocator.free(token);
 
     const payload = try identity_sdp.fingerprintPayload(allocator, options.sdp);
@@ -1003,15 +999,14 @@ fn clientOffer(allocator: std.mem.Allocator, issuer: Scheme.KeyPair, peer: Schem
     const payload_segment = encode(payload_buffer.len, &payload_buffer, payload);
     var fingerprint_header_buffer: [256]u8 = undefined;
     const fingerprint_header_segment = encode(fingerprint_header_buffer.len, &fingerprint_header_buffer, options.fingerprint_header);
-    const detached_input = try std.fmt.allocPrint(allocator, "{s}.{s}", .{ fingerprint_header_segment, payload_segment });
+    const detached_input = try allocator.print("{s}.{s}", .{ fingerprint_header_segment, payload_segment });
     defer allocator.free(detached_input);
     const fingerprint_signature = try signatureText(allocator, peer, detached_input);
     defer allocator.free(fingerprint_signature);
-    const fingerprints = try std.fmt.allocPrint(allocator, "{s}..{s}", .{ fingerprint_header_segment, fingerprint_signature });
+    const fingerprints = try allocator.print("{s}..{s}", .{ fingerprint_header_segment, fingerprint_signature });
     defer allocator.free(fingerprints);
 
-    const assertion = try std.fmt.allocPrint(
-        allocator,
+    const assertion = try allocator.print(
         "{{\"fingerprints\":\"{s}\",\"token\":\"{s}\"}}",
         .{ fingerprints, token },
     );
@@ -1064,10 +1059,9 @@ fn replaceTokenHeader(allocator: std.mem.Allocator, signed: []const u8, header_j
     const dot = std.mem.indexOfScalar(u8, assertion.value.token, '.') orelse return error.TestUnexpectedResult;
     var header_buffer: [256]u8 = undefined;
     const header_segment = encode(header_buffer.len, &header_buffer, header_json);
-    const token = try std.fmt.allocPrint(allocator, "{s}{s}", .{ header_segment, assertion.value.token[dot..] });
+    const token = try allocator.print("{s}{s}", .{ header_segment, assertion.value.token[dot..] });
     defer allocator.free(token);
-    const rebuilt = try std.fmt.allocPrint(
-        allocator,
+    const rebuilt = try allocator.print(
         "{{\"fingerprints\":\"{s}\",\"token\":\"{s}\"}}",
         .{ assertion.value.fingerprints, token },
     );
@@ -1223,10 +1217,9 @@ test "an oversized identity is refused on its length" {
     var verifier = try verifierFor(jwks);
     defer verifier.deinit();
 
-    const oversized = try std.fmt.allocPrint(
-        std.testing.allocator,
+    const oversized = try std.testing.allocator.print(
         "v=0\r\na=ice-ufrag:abcd\r\na=fingerprint:sha-256 AA:BB\r\na=identity:{s}\r\nm=application 9 UDP/DTLS/SCTP webrtc-datachannel\r\n",
-        .{"A" ** (64 * 1024 + 1)},
+        .{@as([64 * 1024 + 1]u8, @splat('A'))},
     );
     defer std.testing.allocator.free(oversized);
     try testing.expectError(error.IdentityTooLarge, verifier.verifyOffer(oversized));
@@ -1247,12 +1240,11 @@ fn rsaFixtureOffer(allocator: std.mem.Allocator, token: []const u8) ![]u8 {
     defer allocator.free(payload);
     var payload_buffer: [2048]u8 = undefined;
     const payload_segment = encode(payload_buffer.len, &payload_buffer, payload);
-    const detached_input = try std.fmt.allocPrint(allocator, "{s}.{s}", .{ protected_header, payload_segment });
+    const detached_input = try allocator.print("{s}.{s}", .{ protected_header, payload_segment });
     defer allocator.free(detached_input);
     const signature = try signatureText(allocator, peer, detached_input);
     defer allocator.free(signature);
-    const assertion = try std.fmt.allocPrint(
-        allocator,
+    const assertion = try allocator.print(
         "{{\"fingerprints\":\"{s}..{s}\",\"token\":\"{s}\"}}",
         .{ protected_header, signature, token },
     );
@@ -1398,8 +1390,8 @@ test "an oversized detached header is refused before it is decoded" {
     const peer = try testKey(0x42);
     var buffer: [64]u8 align(@alignOf(usize)) = undefined;
     var allocator: std.heap.FixedBufferAllocator = .init(&buffer);
-    const header = "A" ** (max_jws_header_b64 + 1);
-    const jws = try std.fmt.allocPrint(testing.allocator, "{s}..AAAA", .{header});
+    const header: [max_jws_header_b64 + 1]u8 = @splat('A');
+    const jws = try testing.allocator.print("{s}..AAAA", .{header});
     defer testing.allocator.free(jws);
     try testing.expectError(error.InvalidIdentity, verifyFingerprints(allocator.allocator(), peer.public_key, jws, test_sdp));
 }
@@ -1460,7 +1452,7 @@ test "a token is only as fresh as its exp claim" {
 test "a token whose header names another algorithm is refused before its signature" {
     var header_buffer: [64]u8 = undefined;
     const header = encode(header_buffer.len, &header_buffer, "{\"alg\":\"none\"}");
-    const token = try std.fmt.allocPrint(testing.allocator, "{s}.e30.AAAA", .{header});
+    const token = try testing.allocator.print("{s}.e30.AAAA", .{header});
     defer testing.allocator.free(token);
     try testing.expectError(error.UnsupportedAlgorithm, verifyToken(testing.io, testing.allocator, token, .{}));
 }
@@ -1495,7 +1487,7 @@ test "the claim's own jws and token are checked without an issuer" {
     defer token_identity.deinit(testing.allocator);
     try testing.expectEqual(identity.form, token_identity.form);
 
-    const attached = try std.fmt.allocPrint(testing.allocator, "eyJhbGciOiJFUzM4NCJ9.e30.{s}", .{
+    const attached = try testing.allocator.print("eyJhbGciOiJFUzM4NCJ9.e30.{s}", .{
         assertion.value.fingerprints[std.mem.lastIndexOfScalar(u8, assertion.value.fingerprints, '.').? + 1 ..],
     });
     defer testing.allocator.free(attached);

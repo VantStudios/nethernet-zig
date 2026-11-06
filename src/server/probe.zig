@@ -343,7 +343,7 @@ fn framedReply(wire: []const u8) ?usize {
 
 test "framed replies are length-checked" {
     try std.testing.expectEqual(@as(?usize, 6), framedReply(&request_wire));
-    try std.testing.expectEqual(@as(?usize, 12), framedReply(&[_]u8{ 0x00, 0x0c, 0x8f, 0x01 } ++ [_]u8{0} ** 10));
+    try std.testing.expectEqual(@as(?usize, 12), framedReply(&[_]u8{ 0x00, 0x0c, 0x8f, 0x01 } ++ @as([10]u8, @splat(0))));
     try std.testing.expect(framedReply(&[_]u8{ 0x01, 0x02, 0xaa, 0xbb }) == null);
     try std.testing.expect(framedReply(&[_]u8{ 0x00, 0xff, 0xaa }) == null);
     try std.testing.expect(framedReply(&[_]u8{ 0x00, 0x01 }) == null);

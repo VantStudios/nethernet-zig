@@ -284,7 +284,7 @@ fn writeServerDataShape(writer: *std.Io.Writer, data: []const u8) !void {
             server_data.level_name,
             server_data.player_count,
             server_data.max_player_count,
-            @intFromEnum(server_data.game_type),
+            @backingInt(server_data.game_type),
             @intFromBool(server_data.editor_world),
             @intFromBool(server_data.hardcore),
             @intFromBool(server_data.accepts_online_auth),
@@ -348,7 +348,7 @@ fn runDiscover(init: std.process.Init, target: []const u8, port: u16) !void {
 }
 
 fn writeMotdShape(writer: *std.Io.Writer, motd: []const u8) !void {
-    var fields = [_][]const u8{""} ** 13;
+    var fields: [13][]const u8 = @splat("");
     var iterator = std.mem.splitScalar(u8, motd, ';');
     var index: usize = 0;
     while (iterator.next()) |field| {

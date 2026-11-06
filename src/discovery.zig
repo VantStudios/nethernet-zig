@@ -118,7 +118,7 @@ pub const ServerData = struct {
         try writeString(writer, self.level_name);
         try writeVarInt(writer, self.player_count);
         try writeVarInt(writer, self.max_player_count);
-        try writeVarInt(writer, @intFromEnum(self.game_type));
+        try writeVarInt(writer, @backingInt(self.game_type));
         try writer.writeByte(@intFromBool(self.editor_world));
         try writer.writeByte(@intFromBool(self.hardcore));
         try writer.writeByte(@intFromBool(self.accepts_online_auth));
@@ -453,7 +453,7 @@ fn buildPayload(buffer: []u8, kind: PacketKind, sender_id: u64, body: []const u8
     if (buffer.len < 20 + body.len) return error.PayloadTooLarge;
     const payload = buffer[0 .. 20 + body.len];
     std.mem.writeInt(u16, payload[0..2], @intCast(payload.len), .little);
-    std.mem.writeInt(u16, payload[2..4], @intFromEnum(kind), .little);
+    std.mem.writeInt(u16, payload[2..4], @backingInt(kind), .little);
     std.mem.writeInt(u64, payload[4..12], sender_id, .little);
     @memset(payload[12..20], 0);
     @memcpy(payload[20..], body);
@@ -474,7 +474,7 @@ pub fn encodePacketInPlace(buffer: []u8, kind: PacketKind, sender_id: u64, body:
     if (buffer.len < 32 + sealedLength(payload_len)) return error.PayloadTooLarge;
     const payload = buffer[32..][0..payload_len];
     std.mem.writeInt(u16, payload[0..2], @intCast(payload_len), .little);
-    std.mem.writeInt(u16, payload[2..4], @intFromEnum(kind), .little);
+    std.mem.writeInt(u16, payload[2..4], @backingInt(kind), .little);
     std.mem.writeInt(u64, payload[4..12], sender_id, .little);
     @memset(payload[12..20], 0);
     @memcpy(payload[20..], body);
@@ -499,7 +499,7 @@ pub fn encodeResponseInPlace(buffer: []u8, sender_id: u64, application_data: []c
     if (buffer.len < 32 + sealedLength(payload_len)) return error.PayloadTooLarge;
     const payload = buffer[32..][0..payload_len];
     std.mem.writeInt(u16, payload[0..2], @intCast(payload_len), .little);
-    std.mem.writeInt(u16, payload[2..4], @intFromEnum(PacketKind.response), .little);
+    std.mem.writeInt(u16, payload[2..4], @backingInt(PacketKind.response), .little);
     std.mem.writeInt(u64, payload[4..12], sender_id, .little);
     @memset(payload[12..20], 0);
     std.mem.writeInt(u32, payload[20..24], @intCast(hex_len), .little);
@@ -520,7 +520,7 @@ pub fn encodeMessageInPlace(buffer: []u8, sender_id: u64, recipient_id: u64, dat
     if (buffer.len < 32 + sealedLength(payload_len)) return error.PayloadTooLarge;
     const payload = buffer[32..][0..payload_len];
     std.mem.writeInt(u16, payload[0..2], @intCast(payload_len), .little);
-    std.mem.writeInt(u16, payload[2..4], @intFromEnum(PacketKind.message), .little);
+    std.mem.writeInt(u16, payload[2..4], @backingInt(PacketKind.message), .little);
     std.mem.writeInt(u64, payload[4..12], sender_id, .little);
     @memset(payload[12..20], 0);
     std.mem.writeInt(u64, payload[20..28], recipient_id, .little);

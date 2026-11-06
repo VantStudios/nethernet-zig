@@ -130,7 +130,7 @@ pub const ClientTransport = struct {
         }
 
         var response = try req.receiveHead(&.{});
-        const status = @intFromEnum(response.head.status);
+        const status = @backingInt(response.head.status);
         if (response.head.content_type) |value| {
             const length = @min(value.len, self.content_type_storage.len);
             @memcpy(self.content_type_storage[0..length], value[0..length]);
@@ -178,7 +178,7 @@ pub const ClientTransport = struct {
 
 fn joinUrl(allocator: std.mem.Allocator, origin: []const u8, path: []const u8) ![]u8 {
     const trimmed = std.mem.trimEnd(u8, origin, "/");
-    return std.fmt.allocPrint(allocator, "{s}{s}", .{ trimmed, path });
+    return allocator.print("{s}{s}", .{ trimmed, path });
 }
 
 pub const Transport = struct {
@@ -219,7 +219,7 @@ pub const Joiner = struct {
 
     fn endpoint(self: *const Joiner, comptime suffix: []const u8, args: anytype) ![]u8 {
         const prefix = std.mem.trimEnd(u8, self.base_path, "/");
-        return std.fmt.allocPrint(self.allocator, "{s}" ++ suffix, .{prefix} ++ args);
+        return self.allocator.print("{s}" ++ suffix, .{prefix} ++ args);
     }
 
     fn networkPath(self: *const Joiner, network_id: []const u8) std.mem.Allocator.Error![]u8 {
@@ -399,7 +399,7 @@ test "HTTP joiner refuses a network id the server could not route" {
     joiner.state = .capability_known;
     try std.testing.expectError(error.InvalidNetworkId, joiner.submitOfferRaw("a/b", "v=0\r\n"));
     try std.testing.expectError(error.InvalidNetworkId, joiner.submitOfferRaw("", "v=0\r\n"));
-    try std.testing.expectError(error.InvalidNetworkId, joiner.submitOfferRaw("a" ** (1024 + 1), "v=0\r\n"));
+    try std.testing.expectError(error.InvalidNetworkId, joiner.submitOfferRaw(&@as([1024 + 1]u8, @splat('a')), "v=0\r\n"));
     try std.testing.expectError(error.InvalidNetworkId, joiner.submitOfferRaw("\xff", "v=0\r\n"));
 }
 

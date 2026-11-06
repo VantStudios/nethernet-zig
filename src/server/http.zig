@@ -237,7 +237,7 @@ const JoinState = struct {
         errdefer allocator.destroy(self);
         const stored = try allocator.dupe(u8, network_id);
         errdefer allocator.free(stored);
-        const key = try std.fmt.allocPrint(allocator, "{s}#{x}", .{ network_id, offer_hash });
+        const key = try allocator.print("{s}#{x}", .{ network_id, offer_hash });
         errdefer allocator.free(key);
         self.* = .{ .io = io, .allocator = allocator, .key = key, .network_id = stored };
         return self;
@@ -1380,7 +1380,7 @@ fn writeStatusBody(
     try writer.print("\",\"players\":{d},\"maxPlayers\":{d},\"gameType\":{d},\"editor\":{s},\"hardcore\":{s},\"onlineAuth\":{s},\"selfSignedAuth\":{s},\"nonce\":\"", .{
         players,
         capacity,
-        @intFromEnum(data.game_type),
+        @backingInt(data.game_type),
         boolText(data.editor_world),
         boolText(data.hardcore),
         boolText(data.accepts_online_auth),
@@ -1492,16 +1492,20 @@ test "an unusable network id is refused instead of repaired" {
 
 test "the network id limit bounds the decoded segment, not the path" {
     const allocator = std.testing.allocator;
-    const long = "a" ** 300;
-    const decoded = try decodeNetworkId(allocator, long, 1024);
+    const long: [300]u8 = @splat('a');
+    const decoded = try decodeNetworkId(allocator, &long, 1024);
     defer allocator.free(decoded);
     try std.testing.expectEqual(@as(usize, 300), decoded.len);
 
-    const wider = "a" ** 1025;
-    try std.testing.expectError(error.NetworkIdTooLong, decodeNetworkId(allocator, wider, 1024));
+    const wider: [1025]u8 = @splat('a');
+    try std.testing.expectError(error.NetworkIdTooLong, decodeNetworkId(allocator, &wider, 1024));
 
-    const escaped_run = "%41" ** 400;
-    const short = try decodeNetworkId(allocator, escaped_run, 512);
+    const escaped_run: [3 * 400]u8 = blk: {
+        var out: [3 * 400]u8 = undefined;
+        for (0..400) |i| @memcpy(out[i * 3 ..][0..3], "%41");
+        break :blk out;
+    };
+    const short = try decodeNetworkId(allocator, &escaped_run, 512);
     defer allocator.free(short);
     try std.testing.expectEqual(@as(usize, 400), short.len);
 }
@@ -1564,7 +1568,7 @@ test "a join whose network id cannot be decoded is refused before any session" {
     try request.writer.print(
         "POST /v1/join/{s} HTTP/1.1\r\nhost: 127.0.0.1\r\ncontent-type: application/sdp\r\n" ++
             "content-length: 3\r\nconnection: close\r\n\r\nv=0",
-        .{"a" ** 1025},
+        .{@as([1025]u8, @splat('a'))},
     );
     var too_long_buffer: [512]u8 = undefined;
     const too_long = try sendAndServe(io, &server, address, request.written(), &too_long_buffer);
@@ -1827,9 +1831,9 @@ test "a hostile status config still yields parseable json" {
 
 test "the status body fits its buffer at the documented limits" {
     const data: discovery.ServerData = .{
-        .server_name = "\\" ** max_server_name_bytes,
-        .level_name = "\\" ** max_level_name_bytes,
-        .game_version = "\\" ** max_game_version_bytes,
+        .server_name = &@as([max_server_name_bytes]u8, @splat('\\')),
+        .level_name = &@as([max_level_name_bytes]u8, @splat('\\')),
+        .game_version = &@as([max_game_version_bytes]u8, @splat('\\')),
     };
     var body: [status_body_bytes]u8 = undefined;
     var writer: std.Io.Writer = .fixed(&body);
@@ -1856,9 +1860,9 @@ test "invalid server data is refused before listening" {
         .{ .server_name = "bad \xff", .level_name = "level" },
         .{ .server_name = "name", .level_name = "bad \x01" },
         .{ .server_name = "name", .level_name = "level", .game_version = "1.2\n3" },
-        .{ .server_name = "n" ** (max_server_name_bytes + 1), .level_name = "level" },
-        .{ .server_name = "name", .level_name = "l" ** (max_level_name_bytes + 1) },
-        .{ .server_name = "name", .level_name = "level", .game_version = "v" ** (max_game_version_bytes + 1) },
+        .{ .server_name = &@as([max_server_name_bytes + 1]u8, @splat('n')), .level_name = "level" },
+        .{ .server_name = "name", .level_name = &@as([max_level_name_bytes + 1]u8, @splat('l')) },
+        .{ .server_name = "name", .level_name = "level", .game_version = &@as([max_game_version_bytes + 1]u8, @splat('v')) },
     };
     for (cases) |data| {
         try std.testing.expectError(error.InvalidServerData, Server.init(io, std.testing.allocator, .{
@@ -1998,8 +2002,7 @@ fn jwksFor(allocator: std.mem.Allocator, public_key: std.crypto.sign.ecdsa.Ecdsa
     var y_buffer: [std.base64.url_safe_no_pad.Encoder.calcSize(48)]u8 = undefined;
     const x = std.base64.url_safe_no_pad.Encoder.encode(&x_buffer, point[1..49]);
     const y = std.base64.url_safe_no_pad.Encoder.encode(&y_buffer, point[49..97]);
-    return std.fmt.allocPrint(
-        allocator,
+    return allocator.print(
         "{{\"keys\":[{{\"kty\":\"EC\",\"crv\":\"P-384\",\"kid\":\"test\",\"x\":\"{s}\",\"y\":\"{s}\"}}]}}",
         .{ x, y },
     );
@@ -2197,7 +2200,7 @@ test "headers past the configured limit are refused with a 400" {
     var request: std.Io.Writer.Allocating = .init(std.testing.allocator);
     defer request.deinit();
     try request.writer.writeAll("GET /v1/join HTTP/1.1\r\nhost: 127.0.0.1\r\nX-Pad: ");
-    try request.writer.writeAll("a" ** 4096);
+    try request.writer.writeAll(&@as([4096]u8, @splat('a')));
     try request.writer.writeAll("\r\n\r\n");
 
     var response_buffer: [512]u8 = undefined;

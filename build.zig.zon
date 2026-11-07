@@ -7,8 +7,8 @@
 
     .dependencies = .{
         .webrtc = .{
-            .url = "git+https://github.com/tecton-mc/webrtc.git#1a9157475f7b494fed63381bbb9ec0cbde96ace3",
-            .hash = "webrtc-0.2.0-I5-xj0oIBwBOTgjiUubhCFVQql_v1GaJWPRNJX4n4yko",
+            .url = "git+https://github.com/tecton-mc/webrtc.git#a71382f91bfc0f056ff4e38726b38a1880e65000",
+            .hash = "webrtc-0.2.0-I5-xj9wIBwAopmaW8eGoAMzaF7qHshpAD6SuOH2SneEm",
         },
         // Same pin `webrtc` uses, so the `ice.IceServer` this module hands the backend
         // is the very type the backend expects: Zig deduplicates by hash.
